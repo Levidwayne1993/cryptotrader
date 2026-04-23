@@ -511,11 +511,43 @@ export function shouldExecuteTrade(
   return { execute: true, reason: 'All checks passed' };
 }
 
-// ---- Check Exit Conditions ----
+// ============================================================
+// TP TRAIL CONFIG — hold through take profit during momentum spikes
+// ============================================================
+const TP_TRAIL_VOLUME_THRESHOLD = 2.0;   // Current volume must be >= 2x the 20-period avg
+const TP_TRAIL_RSI_THRESHOLD = 60;       // RSI must be >= 60 (strong bullish momentum)
+const TP_TRAIL_MAX_HOLD_PERCENT = 8.0;   // Safety cap — always sell at +8% no matter what
+
+// ---- Detect Momentum Spike ----
+function detectMomentumSpike(ohlcv: OHLCV[]): {
+  isSpike: boolean;
+  volumeRatio: number;
+  rsi: number;
+} {
+  const closes = ohlcv.map(c => c.close);
+  const volumes = ohlcv.map(c => c.volume);
+
+  // Current RSI
+  const rsi = calculateRSI(closes);
+
+  // Volume ratio: current candle vs 20-period average
+  const recentVolumes = volumes.slice(-20);
+  const avgVolume = recentVolumes.reduce((sum, v) => sum + v, 0) / recentVolumes.length;
+  const currentVolume = volumes[volumes.length - 1];
+  const volumeRatio = avgVolume > 0 ? currentVolume / avgVolume : 1;
+
+  // Spike = volume surge AND RSI confirms bullish momentum
+  const isSpike = volumeRatio >= TP_TRAIL_VOLUME_THRESHOLD && rsi >= TP_TRAIL_RSI_THRESHOLD;
+
+  return { isSpike, volumeRatio, rsi };
+}
+
+// ---- Check Exit Conditions (with TP Trail) ----
 export function checkExitConditions(
   position: BotPosition,
   currentPrice: number,
-  strategy: StrategyConfig
+  strategy: StrategyConfig,
+  ohlcv?: OHLCV[]
 ): { shouldSell: boolean; reason: string } {
   const pnlPercent = ((currentPrice - position.entry_price) / position.entry_price) * 100;
 
@@ -524,9 +556,24 @@ export function checkExitConditions(
     return { shouldSell: true, reason: `Stop loss hit (${pnlPercent.toFixed(2)}%)` };
   }
 
-  // Take Profit
+  // TP Trail Safety Cap — always sell at max hold regardless of momentum
+  if (pnlPercent >= TP_TRAIL_MAX_HOLD_PERCENT) {
+    return { shouldSell: true, reason: `TP Trail safety cap hit (+${pnlPercent.toFixed(2)}% >= ${TP_TRAIL_MAX_HOLD_PERCENT}%)` };
+  }
+
+  // Take Profit — with momentum override (TP Trail)
   if (strategy.riskParams.takeProfitPercent > 0 && pnlPercent >= strategy.riskParams.takeProfitPercent) {
-    return { shouldSell: true, reason: `Take profit hit (${pnlPercent.toFixed(2)}%)` };
+    // If we have OHLCV data, check for momentum spike
+    if (ohlcv && ohlcv.length >= 30) {
+      const spike = detectMomentumSpike(ohlcv);
+      if (spike.isSpike) {
+        // Strong momentum detected — skip fixed TP, let trailing stop ride the wave
+        log('info', `\uD83D\uDE80 TP TRAIL: ${position.pair} at +${pnlPercent.toFixed(2)}% — HOLDING through TP (Vol: ${spike.volumeRatio.toFixed(1)}x avg, RSI: ${spike.rsi.toFixed(0)})`);
+        return { shouldSell: false, reason: '' };
+      }
+    }
+    // No spike or no data — take profit normally
+    return { shouldSell: true, reason: `Take profit hit (+${pnlPercent.toFixed(2)}%)` };
   }
 
   // Trailing Stop
