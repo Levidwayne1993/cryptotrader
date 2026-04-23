@@ -33,15 +33,8 @@ import { log } from './logger';
 
 // Default trading pairs
 const DEFAULT_PAIRS = [
-  'BTC/USD',
-  'ETH/USD',
-  'SOL/USD',
-  'DOGE/USD',
-  'ADA/USD',
-  'XRP/USD',
-  'DOT/USD',
-  'AVAX/USD',
-  'LINK/USD',
+  'BTC/USD', 'ETH/USD', 'SOL/USD', 'DOGE/USD', 'ADA/USD',
+  'XRP/USD', 'DOT/USD', 'AVAX/USD', 'LINK/USD',
 ];
 
 export class TradingBot {
@@ -55,7 +48,6 @@ export class TradingBot {
 
   constructor() {
     const mode = (process.env.TRADE_MODE || 'paper') as TradeMode;
-
     this.exchange = new KrakenExchange(mode);
 
     this.settings = {
@@ -64,7 +56,9 @@ export class TradingBot {
       mode,
       initial_balance: parseFloat(process.env.INITIAL_BALANCE || '1000'),
       current_balance: parseFloat(process.env.INITIAL_BALANCE || '1000'),
-      selected_pairs: (process.env.TRADING_PAIRS || DEFAULT_PAIRS.join(',')).split(',').map(s => s.trim()),
+      selected_pairs: (process.env.TRADING_PAIRS || DEFAULT_PAIRS.join(','))
+        .split(',')
+        .map(s => s.trim()),
       max_daily_trades: parseInt(process.env.MAX_DAILY_TRADES || '30'),
       daily_loss_limit_percent: parseFloat(process.env.DAILY_LOSS_LIMIT || '5'),
     };
@@ -85,7 +79,6 @@ export class TradingBot {
     const connected = await this.exchange.testConnection();
     if (!connected) {
       log('error', 'Cannot connect to Kraken. Check API keys.');
-      // Continue anyway for paper mode — we can still fetch public data
       if (this.settings.mode === 'live') {
         log('error', 'LIVE mode requires valid API keys. Exiting.');
         process.exit(1);
@@ -107,7 +100,6 @@ export class TradingBot {
     // Start the trading loop
     const strategy = getStrategy(this.settings.strategy);
     this.isRunning = true;
-
     log('info', `Starting trading loop — interval: ${strategy.intervalMs / 1000}s`);
 
     // Run first cycle immediately
@@ -129,7 +121,6 @@ export class TradingBot {
   private async runCycle(): Promise<void> {
     this.cycleCount++;
     const strategy = getStrategy(this.settings.strategy);
-
     log('info', `--- Cycle #${this.cycleCount} [${strategy.shortName}] ---`);
 
     try {
@@ -166,7 +157,6 @@ export class TradingBot {
           marketData.current_price,
           strategy
         );
-
         if (exitCheck.shouldSell) {
           await this.executeSell(updatedPosition, marketData.current_price, exitCheck.reason, strategy);
         }
@@ -174,7 +164,6 @@ export class TradingBot {
 
       // 4. Analyze each pair for new entries
       const analyses: AnalysisResult[] = [];
-
       for (const marketData of marketDataList) {
         if (marketData.ohlcv.length < 30) {
           log('warn', `Insufficient data for ${marketData.pair} — need 30+ candles, got ${marketData.ohlcv.length}`);
@@ -183,6 +172,9 @@ export class TradingBot {
 
         const analysis = analyzeCoin(marketData, fearGreed, strategy);
         analyses.push(analysis);
+
+        // Log every coin's score (not just non-HOLD)
+        log('info', `${analysis.pair}: score=${analysis.score} conf=${analysis.confidence}% -> ${analysis.action}`);
 
         // Log signals
         if (analysis.action !== 'HOLD') {
@@ -237,7 +229,6 @@ export class TradingBot {
 
       // 7. Log summary
       this.logSummary();
-
     } catch (err: any) {
       log('error', `Cycle error: ${err.message}`);
     }
@@ -249,7 +240,8 @@ export class TradingBot {
     strategy: ReturnType<typeof getStrategy>
   ): Promise<void> {
     // Calculate position size
-    let positionSize = this.settings.current_balance * (strategy.riskParams.maxPositionPercent / 100);
+    let positionSize =
+      this.settings.current_balance * (strategy.riskParams.maxPositionPercent / 100);
 
     // DCA Smart sizing
     if (strategy.id === 'dca') {
@@ -264,7 +256,6 @@ export class TradingBot {
     }
 
     positionSize = Math.min(positionSize, this.settings.current_balance);
-
     if (positionSize < 5) {
       log('warn', `Position size too small ($${positionSize.toFixed(2)}) — skipping`);
       return;
@@ -272,7 +263,6 @@ export class TradingBot {
 
     // Place the order
     const result = await this.exchange.marketBuy(analysis.pair, positionSize);
-
     if (!result.success) {
       log('error', `Buy failed: ${result.error}`);
       return;
@@ -285,12 +275,14 @@ export class TradingBot {
     this.settings.current_balance -= positionSize;
 
     // Calculate stop loss and take profit
-    const stopLossPrice = strategy.riskParams.stopLossPercent > 0
-      ? price * (1 - strategy.riskParams.stopLossPercent / 100)
-      : 0;
-    const takeProfitPrice = strategy.riskParams.takeProfitPercent > 0
-      ? price * (1 + strategy.riskParams.takeProfitPercent / 100)
-      : 0;
+    const stopLossPrice =
+      strategy.riskParams.stopLossPercent > 0
+        ? price * (1 - strategy.riskParams.stopLossPercent / 100)
+        : 0;
+    const takeProfitPrice =
+      strategy.riskParams.takeProfitPercent > 0
+        ? price * (1 + strategy.riskParams.takeProfitPercent / 100)
+        : 0;
 
     // Create position
     const position: BotPosition = {
@@ -352,7 +344,6 @@ export class TradingBot {
     strategy: ReturnType<typeof getStrategy>
   ): Promise<void> {
     const result = await this.exchange.marketSell(position.pair, position.quantity);
-
     if (!result.success) {
       log('error', `Sell failed: ${result.error}`);
       return;
@@ -360,7 +351,8 @@ export class TradingBot {
 
     const exitPrice = result.price || currentPrice;
     const pnl = (exitPrice - position.entry_price) * position.quantity;
-    const pnlPercent = ((exitPrice - position.entry_price) / position.entry_price) * 100;
+    const pnlPercent =
+      ((exitPrice - position.entry_price) / position.entry_price) * 100;
 
     // Update balance
     this.settings.current_balance += exitPrice * position.quantity;
@@ -407,8 +399,10 @@ export class TradingBot {
     const closedTrades = this.recentTrades.filter((t) => t.status === 'closed');
     const totalPnl = closedTrades.reduce((sum, t) => sum + (t.pnl || 0), 0);
     const wins = closedTrades.filter((t) => (t.pnl || 0) > 0).length;
-    const winRate = closedTrades.length > 0 ? ((wins / closedTrades.length) * 100).toFixed(1) : '0.0';
-
+    const winRate =
+      closedTrades.length > 0
+        ? ((wins / closedTrades.length) * 100).toFixed(1)
+        : '0.0';
     const unrealizedPnl = this.positions.reduce((sum, p) => sum + p.unrealized_pnl, 0);
 
     log('info', [

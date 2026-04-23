@@ -1,5 +1,5 @@
-// ============================================================
-// All 6 trading strategy configurations — ported from original
+﻿// ============================================================
+// All 6 trading strategy configurations â€” ported from original
 // ============================================================
 
 import { StrategyConfig, StrategyType } from './types';
@@ -20,7 +20,7 @@ export const STRATEGIES: Record<StrategyType, StrategyConfig> = {
       trailingStopPercent: 2,
       cooldownMs: 5 * 60 * 1000,
     },
-    signalThresholds: { buyScore: 55, sellScore: -35, minConfidence: 60 },
+    signalThresholds: { buyScore: 20, sellScore: -15, minConfidence: 45 },
     indicatorWeights: {
       rsi: 20, macd: 20, ema: 15, bollingerBands: 10,
       volume: 15, sentiment: 5, fearGreed: 3, momentum: 10, stochasticRsi: 2,
@@ -42,7 +42,7 @@ export const STRATEGIES: Record<StrategyType, StrategyConfig> = {
       trailingStopPercent: 6,
       cooldownMs: 4 * 60 * 60 * 1000,
     },
-    signalThresholds: { buyScore: 65, sellScore: -45, minConfidence: 70 },
+    signalThresholds: { buyScore: 30, sellScore: -20, minConfidence: 55 },
     indicatorWeights: {
       rsi: 10, macd: 15, ema: 25, bollingerBands: 10,
       volume: 10, sentiment: 10, fearGreed: 8, momentum: 10, stochasticRsi: 2,
@@ -64,7 +64,7 @@ export const STRATEGIES: Record<StrategyType, StrategyConfig> = {
       trailingStopPercent: 0,
       cooldownMs: 2 * 60 * 1000,
     },
-    signalThresholds: { buyScore: 50, sellScore: -30, minConfidence: 55 },
+    signalThresholds: { buyScore: 15, sellScore: -10, minConfidence: 40 },
     indicatorWeights: {
       rsi: 25, macd: 10, ema: 5, bollingerBands: 25,
       volume: 20, sentiment: 2, fearGreed: 1, momentum: 10, stochasticRsi: 2,
@@ -108,7 +108,7 @@ export const STRATEGIES: Record<StrategyType, StrategyConfig> = {
       trailingStopPercent: 8,
       cooldownMs: 60 * 60 * 1000,
     },
-    signalThresholds: { buyScore: 60, sellScore: -50, minConfidence: 65 },
+    signalThresholds: { buyScore: 25, sellScore: -20, minConfidence: 50 },
     indicatorWeights: {
       rsi: 10, macd: 5, ema: 5, bollingerBands: 5,
       volume: 10, sentiment: 25, fearGreed: 30, momentum: 5, stochasticRsi: 5,
@@ -130,7 +130,7 @@ export const STRATEGIES: Record<StrategyType, StrategyConfig> = {
       trailingStopPercent: 5,
       cooldownMs: 15 * 60 * 1000,
     },
-    signalThresholds: { buyScore: 60, sellScore: -40, minConfidence: 65 },
+    signalThresholds: { buyScore: 25, sellScore: -18, minConfidence: 50 },
     indicatorWeights: {
       rsi: 10, macd: 20, ema: 20, bollingerBands: 5,
       volume: 20, sentiment: 5, fearGreed: 5, momentum: 15, stochasticRsi: 0,
