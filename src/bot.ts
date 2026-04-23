@@ -823,10 +823,14 @@ export class TradingBot {
     await this.alertManager.tradeOpened({
       pair: position.pair,
       price: fillPrice,
+      quantity: fillQty,
+      positionSize: dcaBudget,
       score: 0,
       confidence: 0,
-      positionSize: dcaBudget,
-      reason: `DCA Safety Order #${dcaOrderNumber} — averaged down from $${position.entry_price.toFixed(2)} to $${newAvg.toFixed(2)}`,
+      stopLoss: this.positions.find(p => p.pair === position.pair)?.stop_loss_price || 0,
+      takeProfit: this.positions.find(p => p.pair === position.pair)?.take_profit_price || 0,
+      strategy: strategy.id,
+      kellyFraction: position.kelly_fraction,
     });
   }
 
