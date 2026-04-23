@@ -187,7 +187,7 @@ export class KrakenExchange {
       body: postData,
     });
 
-    const json = await response.json();
+    const json: any = await response.json();
     if (json.error && json.error.length > 0) {
       throw new Error(`Kraken API error: ${json.error.join(', ')}`);
     }
@@ -201,11 +201,11 @@ export class KrakenExchange {
     try {
       await this.rateLimit();
       const response = await fetch('https://api.kraken.com/0/public/SystemStatus');
-      const json = await response.json();
+      const json: any = await response.json();
       if (json.result?.status === 'online') {
         // Also get asset pair count
         const pairsRes = await fetch('https://api.kraken.com/0/public/AssetPairs');
-        const pairsJson = await pairsRes.json();
+        const pairsJson: any = await pairsRes.json();
         const pairCount = Object.keys(pairsJson.result || {}).length;
         log('info', `Connected to Kraken — ${pairCount} markets available`);
         return true;
@@ -229,7 +229,7 @@ export class KrakenExchange {
       const url = `https://api.kraken.com/0/public/OHLC?pair=${krakenPair}&interval=${interval}`;
 
       const response = await fetch(url);
-      const json = await response.json();
+      const json: any = await response.json();
 
       if (json.error && json.error.length > 0) {
         log('warn', `OHLCV error for ${pair}: ${json.error.join(', ')}`);
@@ -266,7 +266,7 @@ export class KrakenExchange {
       const krakenPair = getPair(pair);
       const url = `https://api.kraken.com/0/public/Ticker?pair=${krakenPair}`;
       const response = await fetch(url);
-      const json = await response.json();
+      const json: any = await response.json();
 
       if (json.error && json.error.length > 0) return null;
 
@@ -340,7 +340,7 @@ export class KrakenExchange {
       const krakenPair = getPair(pair);
       const url = `https://api.kraken.com/0/public/Depth?pair=${krakenPair}&count=${depth}`;
       const response = await fetch(url);
-      const json = await response.json();
+      const json: any = await response.json();
 
       if (json.error && json.error.length > 0) return null;
 
@@ -630,8 +630,8 @@ export class KrakenExchange {
         quantity: fill.quantity || volume,
         cost: fill.cost || amountUSD,
         fee: fill.fee || 0,
-        orderType: 'market',
-        status: fill.status || 'filled',
+        orderType: 'market' as const,
+        status: (fill.status || 'filled') as 'filled',
       };
     } catch (err: any) {
       log('error', `LIVE market buy failed: ${err.message}`);
@@ -672,8 +672,8 @@ export class KrakenExchange {
         quantity: fill.quantity || quantity,
         cost: fill.cost || quantity * ticker.bid,
         fee: fill.fee || 0,
-        orderType: 'market',
-        status: fill.status || 'filled',
+        orderType: 'market' as const,
+        status: (fill.status || 'filled') as 'filled',
       };
     } catch (err: any) {
       log('error', `LIVE market sell failed: ${err.message}`);
@@ -735,8 +735,8 @@ export class KrakenExchange {
         quantity: fill.quantity || volume,
         cost: fill.cost || amountUSD,
         fee: fill.fee || 0,
-        orderType: 'limit',
-        status: fill.status || 'filled',
+        orderType: 'limit' as const,
+        status: (fill.status || 'filled') as 'filled',
       };
     } catch (err: any) {
       log('error', `LIVE limit buy failed: ${err.message}`);
@@ -791,8 +791,8 @@ export class KrakenExchange {
         quantity: fill.quantity || quantity,
         cost: fill.cost || quantity * price,
         fee: fill.fee || 0,
-        orderType: 'limit',
-        status: fill.status || 'filled',
+        orderType: 'limit' as const,
+        status: (fill.status || 'filled') as 'filled',
       };
     } catch (err: any) {
       log('error', `LIVE limit sell failed: ${err.message}`);
@@ -903,8 +903,8 @@ export class KrakenExchange {
         quantity,
         cost: amountUSD,
         fee: 0, // Fees handled by bot.ts
-        orderType: 'market',
-        status: 'filled',
+        orderType: 'market' as const,
+        status: 'filled' as const,
       };
     } catch (err: any) {
       return { success: false, error: err.message };
@@ -929,8 +929,8 @@ export class KrakenExchange {
         quantity,
         cost: quantity * fillPrice,
         fee: 0,
-        orderType: 'market',
-        status: 'filled',
+        orderType: 'market' as const,
+        status: 'filled' as const,
       };
     } catch (err: any) {
       return { success: false, error: err.message };
