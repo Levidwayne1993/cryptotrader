@@ -112,7 +112,11 @@ export class TradingBot {
     }
 
     await this.loadState();
-    this.dailyStartBalance = this.settings.current_balance;
+
+    // FIX: Include existing position values in dailyStartBalance
+    // so buying into positions isn't counted as a "loss"
+    const startingPositionValue = this.positions.reduce((sum, p) => sum + p.position_value, 0);
+    this.dailyStartBalance = this.settings.current_balance + startingPositionValue;
 
     if (this.settings.mode === 'live') {
       const balance = await this.exchange.getBalance();
@@ -537,10 +541,13 @@ export class TradingBot {
   // ============================================================
   // CIRCUIT BREAKER
   // ============================================================
+
+  // FIX: Use total portfolio value (cash + positions) instead of cash-only
   private checkDailyLoss(): void {
     if (this.dailyStartBalance <= 0) return;
+    const totalValue = this.getTotalPortfolioValue();
     const dailyLossPercent =
-      ((this.dailyStartBalance - this.settings.current_balance) / this.dailyStartBalance) * 100;
+      ((this.dailyStartBalance - totalValue) / this.dailyStartBalance) * 100;
     this.circuitBreaker.daily_loss_percent = dailyLossPercent;
 
     if (dailyLossPercent >= this.settings.daily_loss_limit_percent) {
@@ -608,6 +615,13 @@ export class TradingBot {
   // ============================================================
   // LOGGING & STATE
   // ============================================================
+
+  // FIX: Helper to calculate total portfolio value (cash + all open positions)
+  private getTotalPortfolioValue(): number {
+    const positionValue = this.positions.reduce((sum, p) => sum + p.position_value, 0);
+    return this.settings.current_balance + positionValue;
+  }
+
   private logSummary(): void {
     const closed = this.recentTrades.filter(t => t.status === 'closed');
     const totalPnl = closed.reduce((sum, t) => sum + (t.pnl || 0), 0);
