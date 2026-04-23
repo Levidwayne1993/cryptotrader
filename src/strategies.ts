@@ -2,8 +2,8 @@
 // PROJECT: cryptotrader
 // FILE: src/strategies.ts
 // DESCRIPTION: All 6 strategies with pro indicator weights
-//   Now includes ADX, OBV, VWAP, Ichimoku, Fibonacci,
-//   order book, whale flow, and multi-timeframe weights
+//   ADX, OBV, VWAP, Ichimoku, Fibonacci, order book, whale flow,
+//   multi-timeframe weights + Partial TP, DCA Safety Orders, Dynamic SL
 // ============================================================
 
 import { StrategyConfig, StrategyType } from './types';
@@ -34,6 +34,19 @@ export const STRATEGIES: Record<StrategyType, StrategyConfig> = {
       useKellySizing: true,
       maxKellyPercent: 20,
       riskPerTradePercent: 2,
+      // Partial Take Profit
+      partialTpEnabled: true,
+      tp1Percent: 2.33,            // First partial sell at +2.33%
+      tp1SellPercent: 50,           // Sell 50% at TP1
+      // DCA Safety Orders
+      dcaEnabled: true,
+      dcaMaxOrders: 3,
+      dcaStepPercent: 1.5,          // First DCA at -1.5%
+      dcaStepMultiplier: 1.5,       // Each step wider: -1.5%, -3.75%, -7.125%
+      dcaOrderSizePercent: 50,      // Each DCA = 50% of original buy
+      // Dynamic SL Tightening
+      dynamicSlEnabled: true,
+      // dynamicSlLevels uses defaults from engine.ts: +3%→1.5%, +5%→3.5%, +7%→5.5%
     },
     signalThresholds: {
       buyScore: 6,

@@ -1,7 +1,11 @@
 // ============================================================
 // PROJECT: cryptotrader
-// FILE: src/types.ts
+// FILE: src/types.ts  (UPDATED — replaces existing file)
 // DESCRIPTION: Complete type definitions for all pro features
+//   NOW INCLUDES:
+//   - Partial Take Profit (laddered TP) fields
+//   - DCA Safety Order fields
+//   - Dynamic SL Tightening support
 // ============================================================
 
 // ---- Core Enums ----
@@ -298,6 +302,35 @@ export interface RiskParams {
   useKellySizing?: boolean;
   maxKellyPercent?: number;      // cap Kelly at this %
   riskPerTradePercent?: number;  // for ATR-based sizing
+  // ============================================================
+  // PARTIAL TAKE PROFIT CONFIG
+  //   Sell tp1SellPercent% of position at tp1Percent profit,
+  //   then let the rest ride with trailing stop / TP Trail
+  // ============================================================
+  partialTpEnabled?: boolean;
+  tp1Percent?: number;           // e.g., 2.33 — first TP level
+  tp1SellPercent?: number;       // e.g., 50 — sell 50% of position at TP1
+  // ============================================================
+  // DCA SAFETY ORDER CONFIG
+  //   When price dips after entry, buy more to average down
+  // ============================================================
+  dcaEnabled?: boolean;
+  dcaMaxOrders?: number;         // Max # of safety orders (e.g., 3)
+  dcaStepPercent?: number;       // First safety order triggers at -X% (e.g., 1.5)
+  dcaStepMultiplier?: number;    // Each subsequent step is wider by this factor (e.g., 1.5)
+  dcaOrderSizePercent?: number;  // Each DCA order size as % of original buy (e.g., 50)
+  // ============================================================
+  // DYNAMIC SL TIGHTENING CONFIG
+  //   Progressive stop loss that locks in more profit as price rises
+  // ============================================================
+  dynamicSlEnabled?: boolean;
+  dynamicSlLevels?: DynamicSlLevel[];  // Custom tightening tiers
+}
+
+// Dynamic SL Tightening tier definition
+export interface DynamicSlLevel {
+  profitPercent: number;    // When profit reaches this % (e.g., 3)
+  lockPercent: number;      // Move SL to this % above entry (e.g., 1.5)
 }
 
 export interface SignalThresholds {
@@ -396,6 +429,25 @@ export interface BotPosition {
   kelly_fraction?: number;
   risk_amount?: number;
   timeframe_alignment?: number;
+  // ============================================================
+  // PARTIAL TAKE PROFIT (Laddered TP)
+  //   Sell a portion at TP1, let the rest ride with trailing stop
+  // ============================================================
+  original_quantity?: number;      // Full qty before any partial sells
+  tp1_hit?: boolean;               // Whether TP1 has already fired
+  partial_sells_count?: number;    // How many partial sells have executed
+  // ============================================================
+  // DCA SAFETY ORDERS
+  //   Buy more at lower prices to average down entry
+  // ============================================================
+  dca_orders_filled?: number;      // How many safety orders have filled (0, 1, 2, ...)
+  dca_total_invested?: number;     // Total $ invested including all DCA buys
+  average_entry_price?: number;    // Weighted average entry after DCA
+  // ============================================================
+  // DYNAMIC SL TIGHTENING
+  //   Track the last tightening level so we only ratchet up
+  // ============================================================
+  dynamic_sl_level?: number;       // Last profit tier that triggered SL tightening (e.g., 3, 5, 7)
 }
 
 export interface BotTrade {
@@ -427,6 +479,13 @@ export interface BotTrade {
   risk_amount?: number;
   exit_reason?: string;
   timeframe_alignment?: number;
+  // ============================================================
+  // PARTIAL TP + DCA tracking on trade records
+  // ============================================================
+  is_partial?: boolean;             // true if this SELL was a partial TP (not a full exit)
+  is_dca_buy?: boolean;             // true if this BUY was a DCA safety order (not initial entry)
+  average_entry_price?: number;     // Weighted avg entry at time of trade
+  dca_order_number?: number;        // Which DCA order this was (1, 2, 3...)
 }
 
 // ---- Backtesting ----

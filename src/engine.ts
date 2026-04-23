@@ -512,6 +512,15 @@ export function shouldExecuteTrade(
 }
 
 // ============================================================
+// EXIT CHECK RESULT — now supports partial sells
+// ============================================================
+export interface ExitCheckResult {
+  shouldSell: boolean;          // Full position sell
+  shouldPartialSell: boolean;   // Partial TP sell (sell tp1SellPercent% only)
+  reason: string;
+}
+
+// ============================================================
 // TP TRAIL CONFIG — hold through take profit during momentum spikes
 // ============================================================
 const TP_TRAIL_VOLUME_THRESHOLD = 2.0;   // Current volume must be >= 2x the 20-period avg
@@ -542,46 +551,129 @@ function detectMomentumSpike(ohlcv: OHLCV[]): {
   return { isSpike, volumeRatio, rsi };
 }
 
-// ---- Check Exit Conditions (with TP Trail) ----
+// ============================================================
+// DYNAMIC SL TIGHTENING
+//   Progressively ratchet stop loss as profit grows.
+//   Called from bot.ts during position management.
+//   Default tiers:
+//     +3% profit → SL moves to +1.5%
+//     +5% profit → SL moves to +3.5%
+//     +7% profit → SL moves to +5.5%
+// ============================================================
+const DEFAULT_DYNAMIC_SL_LEVELS: { profitPercent: number; lockPercent: number }[] = [
+  { profitPercent: 3,  lockPercent: 1.5 },
+  { profitPercent: 5,  lockPercent: 3.5 },
+  { profitPercent: 7,  lockPercent: 5.5 },
+];
+
+export function applyDynamicSlTightening(
+  position: BotPosition,
+  currentPrice: number,
+  strategy: StrategyConfig
+): { position: BotPosition; tightened: boolean; newSlPrice: number; level: number } {
+  // Use strategy-configured levels or fall back to defaults
+  const levels = strategy.riskParams.dynamicSlLevels || DEFAULT_DYNAMIC_SL_LEVELS;
+  const entryPrice = position.average_entry_price || position.entry_price;
+  const pnlPercent = ((currentPrice - entryPrice) / entryPrice) * 100;
+  const currentLevel = position.dynamic_sl_level || 0;
+
+  let newSlPrice = position.stop_loss_price;
+  let tightened = false;
+  let hitLevel = currentLevel;
+
+  // Walk through levels from highest to lowest — lock the best one we qualify for
+  for (const tier of [...levels].reverse()) {
+    if (pnlPercent >= tier.profitPercent && tier.profitPercent > currentLevel) {
+      const candidateSl = entryPrice * (1 + tier.lockPercent / 100);
+      // Only move SL up, never down
+      if (candidateSl > newSlPrice) {
+        newSlPrice = candidateSl;
+        hitLevel = tier.profitPercent;
+        tightened = true;
+      }
+      break; // We found the highest qualifying tier
+    }
+  }
+
+  if (tightened) {
+    position = { ...position };
+    position.stop_loss_price = newSlPrice;
+    position.dynamic_sl_level = hitLevel;
+  }
+
+  return { position, tightened, newSlPrice, level: hitLevel };
+}
+
+// ============================================================
+// CHECK EXIT CONDITIONS
+//   Now supports: TP Trail, Partial TP, Dynamic SL, Safety Cap
+//   ohlcv is optional — pass it for TP Trail momentum detection
+// ============================================================
 export function checkExitConditions(
   position: BotPosition,
   currentPrice: number,
   strategy: StrategyConfig,
   ohlcv?: OHLCV[]
-): { shouldSell: boolean; reason: string } {
-  const pnlPercent = ((currentPrice - position.entry_price) / position.entry_price) * 100;
+): ExitCheckResult {
+  const entryPrice = position.average_entry_price || position.entry_price;
+  const pnlPercent = ((currentPrice - entryPrice) / entryPrice) * 100;
 
-  // Stop Loss
+  // ---- Stop Loss (ATR-based SL price or percent-based) ----
+  if (position.stop_loss_price > 0 && currentPrice <= position.stop_loss_price) {
+    return { shouldSell: true, shouldPartialSell: false,
+      reason: `Stop loss hit at $${position.stop_loss_price.toFixed(2)} (${pnlPercent.toFixed(2)}%)` };
+  }
+  // Fallback percent-based SL (if stop_loss_price wasn't set)
   if (strategy.riskParams.stopLossPercent > 0 && pnlPercent <= -strategy.riskParams.stopLossPercent) {
-    return { shouldSell: true, reason: `Stop loss hit (${pnlPercent.toFixed(2)}%)` };
+    return { shouldSell: true, shouldPartialSell: false,
+      reason: `Stop loss hit (${pnlPercent.toFixed(2)}%)` };
   }
 
-  // TP Trail Safety Cap — always sell at max hold regardless of momentum
+  // ---- TP Trail Safety Cap — always sell at max hold ----
   if (pnlPercent >= TP_TRAIL_MAX_HOLD_PERCENT) {
-    return { shouldSell: true, reason: `TP Trail safety cap hit (+${pnlPercent.toFixed(2)}% >= ${TP_TRAIL_MAX_HOLD_PERCENT}%)` };
+    return { shouldSell: true, shouldPartialSell: false,
+      reason: `TP Trail safety cap hit (+${pnlPercent.toFixed(2)}% >= ${TP_TRAIL_MAX_HOLD_PERCENT}%)` };
   }
 
-  // Take Profit — with momentum override (TP Trail)
+  // ---- Partial Take Profit (TP1) ----
+  //   If partialTpEnabled and we haven't hit TP1 yet,
+  //   trigger a partial sell at tp1Percent
+  if (strategy.riskParams.partialTpEnabled &&
+      !position.tp1_hit &&
+      strategy.riskParams.tp1Percent &&
+      pnlPercent >= strategy.riskParams.tp1Percent) {
+    return { shouldSell: false, shouldPartialSell: true,
+      reason: `Partial TP1 hit (+${pnlPercent.toFixed(2)}% >= ${strategy.riskParams.tp1Percent}%)` };
+  }
+
+  // ---- Full Take Profit (with TP Trail momentum override) ----
   if (strategy.riskParams.takeProfitPercent > 0 && pnlPercent >= strategy.riskParams.takeProfitPercent) {
-    // If we have OHLCV data, check for momentum spike
-    if (ohlcv && ohlcv.length >= 30) {
-      const spike = detectMomentumSpike(ohlcv);
-      if (spike.isSpike) {
-        // Strong momentum detected — skip fixed TP, let trailing stop ride the wave
-        log('info', `\uD83D\uDE80 TP TRAIL: ${position.pair} at +${pnlPercent.toFixed(2)}% — HOLDING through TP (Vol: ${spike.volumeRatio.toFixed(1)}x avg, RSI: ${spike.rsi.toFixed(0)})`);
-        return { shouldSell: false, reason: '' };
+    // If TP1 already hit, this is the remaining position — let trailing stop handle it
+    if (position.tp1_hit) {
+      // After partial sell, remaining position rides — no fixed TP, trailing stop only
+      // (fall through to trailing stop check below)
+    } else {
+      // Check for momentum spike (TP Trail)
+      if (ohlcv && ohlcv.length >= 30) {
+        const spike = detectMomentumSpike(ohlcv);
+        if (spike.isSpike) {
+          log('info', `\uD83D\uDE80 TP TRAIL: ${position.pair} at +${pnlPercent.toFixed(2)}% — HOLDING through TP (Vol: ${spike.volumeRatio.toFixed(1)}x avg, RSI: ${spike.rsi.toFixed(0)})`);
+          return { shouldSell: false, shouldPartialSell: false, reason: '' };
+        }
       }
+      // No spike — take profit normally
+      return { shouldSell: true, shouldPartialSell: false,
+        reason: `Take profit hit (+${pnlPercent.toFixed(2)}%)` };
     }
-    // No spike or no data — take profit normally
-    return { shouldSell: true, reason: `Take profit hit (+${pnlPercent.toFixed(2)}%)` };
   }
 
-  // Trailing Stop
+  // ---- Trailing Stop ----
   if (position.trailing_stop_price && currentPrice <= position.trailing_stop_price) {
-    return { shouldSell: true, reason: `Trailing stop hit at $${position.trailing_stop_price.toFixed(2)}` };
+    return { shouldSell: true, shouldPartialSell: false,
+      reason: `Trailing stop hit at $${position.trailing_stop_price.toFixed(2)} (+${pnlPercent.toFixed(2)}%)` };
   }
 
-  return { shouldSell: false, reason: '' };
+  return { shouldSell: false, shouldPartialSell: false, reason: '' };
 }
 
 // ---- Update Trailing Stop ----
@@ -604,4 +696,35 @@ export function updateTrailingStop(
   }
 
   return updated;
+}
+
+// ============================================================
+// DCA SAFETY ORDER HELPERS
+//   Calculate the trigger price for each DCA level
+// ============================================================
+export function getDcaTriggerPrice(
+  entryPrice: number,
+  orderNumber: number,
+  stepPercent: number,
+  stepMultiplier: number
+): number {
+  // Order 1 triggers at -stepPercent% from entry
+  // Order 2 triggers at -(stepPercent * stepMultiplier)% from entry
+  // Order 3 triggers at -(stepPercent * stepMultiplier^2)% from entry
+  let totalDrop = 0;
+  for (let i = 0; i < orderNumber; i++) {
+    totalDrop += stepPercent * Math.pow(stepMultiplier, i);
+  }
+  return entryPrice * (1 - totalDrop / 100);
+}
+
+export function calculateAverageEntry(
+  currentAvgEntry: number,
+  currentQty: number,
+  newBuyPrice: number,
+  newBuyQty: number
+): number {
+  const totalCost = (currentAvgEntry * currentQty) + (newBuyPrice * newBuyQty);
+  const totalQty = currentQty + newBuyQty;
+  return totalQty > 0 ? totalCost / totalQty : currentAvgEntry;
 }

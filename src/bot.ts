@@ -1,13 +1,16 @@
 // ============================================================
 // PROJECT: cryptotrader
 // FILE: src/bot.ts (UPDATED — replaces existing file)
-// DESCRIPTION: Main bot controller — ULTIMATE EDITION
+// DESCRIPTION: Main bot controller — ULTIMATE EDITION v2
 //   Everything from PRO EDITION plus:
 //   - Break-even stop loss
 //   - Dynamic fee tiers from Kraken API
 //   - Limit order support (USE_LIMIT_ORDERS env var)
 //   - Market regime detection
 //   - Enhanced logging with fee breakdown
+//   - Partial Take Profit (laddered TP1 sell)
+//   - DCA Safety Orders (average down on dips)
+//   - Dynamic SL Tightening (progressive profit lock)
 // ============================================================
 
 import {
@@ -19,6 +22,8 @@ import { KrakenExchange, getPair, getCoinIdFromPair } from './exchange';
 import {
   analyzeCoin, fetchFearGreed, shouldExecuteTrade,
   checkExitConditions, updateTrailingStop,
+  applyDynamicSlTightening, getDcaTriggerPrice, calculateAverageEntry,
+  ExitCheckResult,
 } from './engine';
 import {
   saveTrade, saveSignal, savePositions, loadPositions,
@@ -38,7 +43,7 @@ const DEFAULT_PAIRS = [
 // ============================================================
 // FEE & RISK CONFIG
 // ============================================================
-const MIN_TAKE_PROFIT_PERCENT = 2.73;         // Minimum 2.73% TP floor (undercut 3% crowd)
+const MIN_TAKE_PROFIT_PERCENT = 2.33;         // Minimum 2.33% TP floor (undercut $80K wall)
 const BREAKEVEN_TRIGGER_PERCENT = 1.87;       // Move SL to entry after 1.87% profit (undercut 2% crowd)
 const BREAKEVEN_BUFFER_PERCENT = 0.1;         // SL set to entry + 0.1% (tiny profit to cover fees)
 
@@ -123,6 +128,9 @@ export class TradingBot {
     log('info', `Order Type: ${this.useLimitOrders ? 'LIMIT (maker fees)' : 'MARKET (taker fees)'}`);
     log('info', `Min Take Profit: ${MIN_TAKE_PROFIT_PERCENT}% (floor to clear fees)`);
     log('info', `Break-Even Stop: Triggers at ${BREAKEVEN_TRIGGER_PERCENT}% profit`);
+    log('info', `Partial TP: ${getStrategy(this.settings.strategy).riskParams.partialTpEnabled ? 'ON' : 'OFF'} | TP1: ${getStrategy(this.settings.strategy).riskParams.tp1Percent || 'N/A'}% | Sell: ${getStrategy(this.settings.strategy).riskParams.tp1SellPercent || 'N/A'}%`);
+    log('info', `DCA Safety Orders: ${getStrategy(this.settings.strategy).riskParams.dcaEnabled ? 'ON' : 'OFF'} | Max: ${getStrategy(this.settings.strategy).riskParams.dcaMaxOrders || 0} | Step: ${getStrategy(this.settings.strategy).riskParams.dcaStepPercent || 'N/A'}%`);
+    log('info', `Dynamic SL Tightening: ${getStrategy(this.settings.strategy).riskParams.dynamicSlEnabled ? 'ON' : 'OFF'}`);
     log('info', '========================================');
 
     const connected = await this.exchange.testConnection();
@@ -246,7 +254,7 @@ export class TradingBot {
         this.lastCorrelationCheck = this.cycleCount;
       }
 
-      // 7. Check exits + BREAK-EVEN stops on existing positions
+      // 7. Check exits + BREAK-EVEN + DYNAMIC SL + DCA + PARTIAL TP
       for (const position of [...this.positions]) {
         const md = marketDataList.find(m => m.pair === position.pair);
         if (!md) continue;
@@ -258,33 +266,74 @@ export class TradingBot {
 
         // ============================================================
         // BREAK-EVEN STOP LOSS
-        // If price has moved X% above entry, move SL to entry + buffer
-        // This turns a winning trade into a risk-free trade
         // ============================================================
         if (idx >= 0) {
+          const entryForBE = this.positions[idx].average_entry_price || this.positions[idx].entry_price;
           const currentProfitPercent =
-            ((md.current_price - this.positions[idx].entry_price) / this.positions[idx].entry_price) * 100;
+            ((md.current_price - entryForBE) / entryForBE) * 100;
 
           if (currentProfitPercent >= BREAKEVEN_TRIGGER_PERCENT) {
-            const breakevenPrice =
-              this.positions[idx].entry_price * (1 + BREAKEVEN_BUFFER_PERCENT / 100);
-
-            // Only move SL up, never down
+            const breakevenPrice = entryForBE * (1 + BREAKEVEN_BUFFER_PERCENT / 100);
             if (this.positions[idx].stop_loss_price < breakevenPrice) {
               const oldSL = this.positions[idx].stop_loss_price;
               this.positions[idx].stop_loss_price = breakevenPrice;
-              log('info', `🛡️ BREAK-EVEN: ${position.pair} SL moved from $${oldSL.toFixed(4)} to $${breakevenPrice.toFixed(4)} (entry + ${BREAKEVEN_BUFFER_PERCENT}%)`);
+              log('info', `\uD83D\uDEE1\uFE0F BREAK-EVEN: ${position.pair} SL moved from $${oldSL.toFixed(4)} to $${breakevenPrice.toFixed(4)} (entry + ${BREAKEVEN_BUFFER_PERCENT}%)`);
             }
           }
         }
 
-        const exit = checkExitConditions(updated, md.current_price, strategy);
-        if (exit.shouldSell) {
-          await this.executeSell(updated, md.current_price, exit.reason, strategy);
+        // ============================================================
+        // DYNAMIC SL TIGHTENING
+        //   Progressively lock in more profit as price rises
+        // ============================================================
+        if (idx >= 0 && strategy.riskParams.dynamicSlEnabled !== false) {
+          const slResult = applyDynamicSlTightening(
+            this.positions[idx], md.current_price, strategy
+          );
+          if (slResult.tightened) {
+            this.positions[idx] = slResult.position;
+            log('info', `\uD83D\uDD12 DYNAMIC SL: ${position.pair} SL tightened to $${slResult.newSlPrice.toFixed(4)} (locking +${slResult.level}% profit tier)`);
+          }
+        }
+
+        // ============================================================
+        // DCA SAFETY ORDERS
+        //   If price drops below DCA trigger levels, buy more to
+        //   average down the entry price
+        // ============================================================
+        if (idx >= 0 && strategy.riskParams.dcaEnabled) {
+          const dcaFilled = this.positions[idx].dca_orders_filled || 0;
+          const dcaMax = strategy.riskParams.dcaMaxOrders || 3;
+          const dcaStep = strategy.riskParams.dcaStepPercent || 1.5;
+          const dcaMult = strategy.riskParams.dcaStepMultiplier || 1.5;
+
+          if (dcaFilled < dcaMax) {
+            const nextDcaOrder = dcaFilled + 1;
+            const triggerPrice = getDcaTriggerPrice(
+              this.positions[idx].entry_price, nextDcaOrder, dcaStep, dcaMult
+            );
+
+            if (md.current_price <= triggerPrice) {
+              await this.executeDcaBuy(this.positions[idx], md.current_price, nextDcaOrder, strategy);
+            }
+          }
+        }
+
+        // ============================================================
+        // EXIT CHECK (with Partial TP + TP Trail + full exits)
+        // ============================================================
+        const currentPos = this.positions[idx];
+        if (!currentPos) continue;
+        const exit = checkExitConditions(currentPos, md.current_price, strategy, md.ohlcv);
+
+        if (exit.shouldPartialSell) {
+          await this.executePartialSell(currentPos, md.current_price, exit.reason, strategy);
+        } else if (exit.shouldSell) {
+          await this.executeSell(currentPos, md.current_price, exit.reason, strategy);
         }
       }
 
-      // 8. Analyze each pair for new entries
+// 8. Analyze each pair for new entries
       for (const md of marketDataList) {
         if (md.ohlcv.length < 30) {
           log('warn', `Insufficient data for ${md.pair} — ${md.ohlcv.length} candles`);
@@ -508,6 +557,14 @@ export class TradingBot {
       atr_at_entry: atrAtEntry,
       kelly_fraction: kellyFraction,
       risk_amount: riskAmount,
+      // Partial TP + DCA tracking fields
+      original_quantity: quantity,
+      tp1_hit: false,
+      partial_sells_count: 0,
+      dca_orders_filled: 0,
+      dca_total_invested: positionSize,
+      average_entry_price: price,
+      dynamic_sl_level: 0,
     };
 
     this.positions.push(position);
@@ -549,7 +606,231 @@ export class TradingBot {
     });
   }
 
+// ============================================================
+  // EXECUTE PARTIAL SELL — sells a portion at TP1, keeps rest riding
   // ============================================================
+  private async executePartialSell(
+    position: BotPosition,
+    currentPrice: number,
+    reason: string,
+    strategy: ReturnType<typeof getStrategy>
+  ): Promise<void> {
+    const feeRate = this.getActiveFeeRate();
+    const sellPercent = (strategy.riskParams.tp1SellPercent || 50) / 100;
+    const sellQty = position.quantity * sellPercent;
+
+    // Execute order
+    let result;
+    if (this.useLimitOrders) {
+      result = await this.exchange.limitSell(position.pair, sellQty);
+    } else {
+      result = await this.exchange.marketSell(position.pair, sellQty);
+    }
+
+    if (!result.success) {
+      log('error', `Partial sell failed: ${result.error}`);
+      return;
+    }
+
+    const exitPrice = result.price || currentPrice;
+    const orderType = result.orderType || (this.useLimitOrders ? 'limit' : 'market');
+
+    // Fee-aware P&L for partial sell
+    const partialEntryValue = position.entry_price * sellQty;
+    const grossPnl = (exitPrice - position.entry_price) * sellQty;
+    const buyFee = partialEntryValue * feeRate;
+    const sellFee = exitPrice * sellQty * feeRate;
+    const totalFees = buyFee + sellFee;
+    const pnl = grossPnl - totalFees;
+    const pnlPercent = (pnl / partialEntryValue) * 100;
+
+    // Credit balance with sell proceeds
+    const sellProceeds = (exitPrice * sellQty) - sellFee;
+    this.settings.current_balance += sellProceeds;
+
+    // Update position — reduce quantity, mark TP1 hit
+    const idx = this.positions.findIndex(p => p.pair === position.pair);
+    if (idx >= 0) {
+      this.positions[idx].quantity -= sellQty;
+      this.positions[idx].tp1_hit = true;
+      this.positions[idx].partial_sells_count = (this.positions[idx].partial_sells_count || 0) + 1;
+
+      // Move SL to break-even after partial TP
+      const entryForBE = this.positions[idx].average_entry_price || this.positions[idx].entry_price;
+      const breakevenPrice = entryForBE * (1 + BREAKEVEN_BUFFER_PERCENT / 100);
+      if (this.positions[idx].stop_loss_price < breakevenPrice) {
+        this.positions[idx].stop_loss_price = breakevenPrice;
+        log('info', `\uD83D\uDEE1\uFE0F TP1 hit \u2014 SL moved to break-even: $${breakevenPrice.toFixed(4)}`);
+      }
+    }
+
+    this.circuitBreaker.trades_today++;
+
+    // Log trade
+    const trade: BotTrade = {
+      coin_id: position.coin_id,
+      symbol: position.symbol,
+      pair: position.pair,
+      action: 'SELL',
+      strategy: strategy.id,
+      entry_price: position.entry_price,
+      exit_price: exitPrice,
+      quantity: sellQty,
+      position_value: exitPrice * sellQty,
+      pnl,
+      pnl_percent: pnlPercent,
+      score: 0,
+      confidence: 0,
+      reasoning: [`Partial TP1: ${reason}`, `Fees: $${totalFees.toFixed(4)} (${orderType})`],
+      status: 'closed',
+      stop_loss_price: position.stop_loss_price,
+      take_profit_price: position.take_profit_price,
+      trailing_stop_price: position.trailing_stop_price,
+      opened_at: position.opened_at,
+      closed_at: new Date().toISOString(),
+      order_id: result.orderId,
+      mode: this.settings.mode,
+      exit_reason: `Partial TP1: ${reason}`,
+      kelly_fraction: position.kelly_fraction,
+      atr_at_entry: position.atr_at_entry,
+      risk_amount: position.risk_amount,
+      is_partial: true,
+      average_entry_price: position.average_entry_price,
+    };
+
+    this.recentTrades.push(trade);
+    await saveTrade(trade);
+
+    log('trade', `\uD83C\uDFAF PARTIAL SELL ${(sellPercent * 100).toFixed(0)}% of ${position.symbol}: ${sellQty.toFixed(8)} @ $${exitPrice.toFixed(2)} | Net: +$${pnl.toFixed(2)} (+${pnlPercent.toFixed(2)}%) | Remaining: ${(position.quantity - sellQty).toFixed(8)} | ${reason}`);
+
+    await this.alertManager.tradeClosed({
+      pair: position.pair,
+      entryPrice: position.entry_price,
+      exitPrice,
+      pnl,
+      pnlPercent,
+      reason: `Partial TP1: ${reason}`,
+      holdTime: `${Math.round((Date.now() - new Date(position.opened_at).getTime()) / 60000)}m`,
+    });
+  }
+
+  // ============================================================
+  // EXECUTE DCA BUY — buy more at a lower price to average down
+  // ============================================================
+  private async executeDcaBuy(
+    position: BotPosition,
+    currentPrice: number,
+    dcaOrderNumber: number,
+    strategy: ReturnType<typeof getStrategy>
+  ): Promise<void> {
+    const feeRate = this.getActiveFeeRate();
+    const dcaSizePercent = (strategy.riskParams.dcaOrderSizePercent || 50) / 100;
+    const originalValue = position.entry_price * (position.original_quantity || position.quantity);
+    const dcaBudget = originalValue * dcaSizePercent;
+
+    // Check if we have enough balance
+    if (this.settings.current_balance < dcaBudget) {
+      log('warn', `\u26A0\uFE0F DCA #${dcaOrderNumber} ${position.pair}: insufficient balance ($${this.settings.current_balance.toFixed(2)} < $${dcaBudget.toFixed(2)})`);
+      return;
+    }
+
+    // Execute buy
+    const dcaQty = dcaBudget / currentPrice;
+    let result;
+    if (this.useLimitOrders) {
+      result = await this.exchange.limitBuy(position.pair, dcaBudget);
+    } else {
+      result = await this.exchange.marketBuy(position.pair, dcaBudget);
+    }
+
+    if (!result.success) {
+      log('error', `DCA buy #${dcaOrderNumber} failed: ${result.error}`);
+      return;
+    }
+
+    const fillPrice = result.price || currentPrice;
+    const fillQty = result.quantity || dcaQty;
+    const orderType = result.orderType || (this.useLimitOrders ? 'limit' : 'market');
+    const buyFee = fillPrice * fillQty * feeRate;
+
+    // Debit balance
+    this.settings.current_balance -= (dcaBudget + buyFee);
+
+    // Update position with new average entry
+    const idx = this.positions.findIndex(p => p.pair === position.pair);
+    if (idx >= 0) {
+      const pos = this.positions[idx];
+      const oldQty = pos.quantity;
+      const oldValue = pos.entry_price * oldQty;
+      const newValue = fillPrice * fillQty;
+
+      pos.quantity = oldQty + fillQty;
+      pos.average_entry_price = (oldValue + newValue) / (oldQty + fillQty);
+      pos.dca_orders_filled = dcaOrderNumber;
+      pos.dca_total_invested = (pos.dca_total_invested || oldValue) + newValue;
+      pos.position_value = pos.quantity * fillPrice;
+
+      // Recalculate SL/TP relative to new average entry
+      const avgEntry = pos.average_entry_price;
+      if (strategy.riskParams.useAtrStops && pos.atr_at_entry) {
+        pos.stop_loss_price = avgEntry - (pos.atr_at_entry * (strategy.riskParams.atrStopMultiplier || 3.7));
+      } else {
+        pos.stop_loss_price = avgEntry * (1 - strategy.riskParams.stopLossPercent / 100);
+      }
+      pos.take_profit_price = avgEntry * (1 + Math.max(
+        strategy.riskParams.takeProfitPercent,
+        MIN_TAKE_PROFIT_PERCENT
+      ) / 100);
+
+      this.positions[idx] = pos;
+    }
+
+    this.circuitBreaker.trades_today++;
+
+    // Log DCA trade
+    const trade: BotTrade = {
+      coin_id: position.coin_id,
+      symbol: position.symbol,
+      pair: position.pair,
+      action: 'BUY',
+      strategy: strategy.id,
+      entry_price: fillPrice,
+      quantity: fillQty,
+      position_value: fillPrice * fillQty,
+      score: 0,
+      confidence: 0,
+      reasoning: [`DCA #${dcaOrderNumber}`, `Avg down from $${position.entry_price.toFixed(2)}`, `Fees: $${buyFee.toFixed(4)} (${orderType})`],
+      status: 'open',
+      stop_loss_price: this.positions.find(p => p.pair === position.pair)?.stop_loss_price,
+      take_profit_price: this.positions.find(p => p.pair === position.pair)?.take_profit_price,
+      opened_at: new Date().toISOString(),
+      order_id: result.orderId,
+      mode: this.settings.mode,
+      kelly_fraction: position.kelly_fraction,
+      atr_at_entry: position.atr_at_entry,
+      risk_amount: position.risk_amount,
+      is_dca_buy: true,
+      dca_order_number: dcaOrderNumber,
+      average_entry_price: this.positions.find(p => p.pair === position.pair)?.average_entry_price,
+    };
+
+    this.recentTrades.push(trade);
+    await saveTrade(trade);
+
+    const newAvg = this.positions.find(p => p.pair === position.pair)?.average_entry_price || fillPrice;
+    log('trade', `\uD83D\uDCE5 DCA #${dcaOrderNumber} ${position.symbol}: +${fillQty.toFixed(8)} @ $${fillPrice.toFixed(2)} ($${dcaBudget.toFixed(2)}) | New avg: $${newAvg.toFixed(2)} | Total qty: ${(position.quantity + fillQty).toFixed(8)}`);
+
+    await this.alertManager.tradeOpened({
+      pair: position.pair,
+      price: fillPrice,
+      score: 0,
+      confidence: 0,
+      size: dcaBudget,
+      reason: `DCA Safety Order #${dcaOrderNumber} — averaged down from $${position.entry_price.toFixed(2)} to $${newAvg.toFixed(2)}`,
+    });
+  }
+
+    // ============================================================
   // EXECUTE SELL — with fee deduction + limit order support
   // ============================================================
   private async executeSell(

@@ -1,8 +1,9 @@
 // ============================================================
 // PROJECT: cryptotrader
 // FILE: src/database.ts
-// DESCRIPTION: Supabase database layer — NOW saves all pro fields
+// DESCRIPTION: Supabase database layer — saves all pro fields
 //   ADX, ATR, multi-timeframe, whale flow, Kelly, exit reason
+//   + Partial TP, DCA Safety Orders, Dynamic SL Tightening fields
 // ============================================================
 
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
@@ -57,6 +58,11 @@ export async function saveTrade(trade: BotTrade): Promise<void> {
       atr_at_entry: trade.atr_at_entry || null,
       risk_amount: trade.risk_amount || null,
       timeframe_alignment: trade.timeframe_alignment || null,
+      // Partial TP + DCA fields
+      is_partial: trade.is_partial || false,
+      is_dca_buy: trade.is_dca_buy || false,
+      average_entry_price: trade.average_entry_price || null,
+      dca_order_number: trade.dca_order_number || null,
     });
 
     if (error) {
@@ -196,6 +202,14 @@ export async function savePositions(positions: BotPosition[]): Promise<void> {
           kelly_fraction: p.kelly_fraction || null,
           risk_amount: p.risk_amount || null,
           timeframe_alignment: p.timeframe_alignment || null,
+          // Partial TP + DCA tracking fields
+          original_quantity: p.original_quantity || null,
+          tp1_hit: p.tp1_hit || false,
+          partial_sells_count: p.partial_sells_count || 0,
+          dca_orders_filled: p.dca_orders_filled || 0,
+          dca_total_invested: p.dca_total_invested || null,
+          average_entry_price: p.average_entry_price || null,
+          dynamic_sl_level: p.dynamic_sl_level || 0,
         }))
       );
 
