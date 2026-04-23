@@ -38,8 +38,8 @@ const DEFAULT_PAIRS = [
 // ============================================================
 // FEE & RISK CONFIG
 // ============================================================
-const MIN_TAKE_PROFIT_PERCENT = 2.0;          // Minimum 2% TP floor
-const BREAKEVEN_TRIGGER_PERCENT = 1.5;        // Move SL to entry after 1.5% profit
+const MIN_TAKE_PROFIT_PERCENT = 2.73;         // Minimum 2.73% TP floor (undercut 3% crowd)
+const BREAKEVEN_TRIGGER_PERCENT = 1.87;       // Move SL to entry after 1.87% profit (undercut 2% crowd)
 const BREAKEVEN_BUFFER_PERCENT = 0.1;         // SL set to entry + 0.1% (tiny profit to cover fees)
 
 export class TradingBot {
