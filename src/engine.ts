@@ -1,344 +1,464 @@
 // ============================================================
-// Analysis engine — ported from bot-engine.ts
-// Now uses Kraken OHLCV data instead of CoinGecko sparklines
+// PROJECT: cryptotrader
+// FILE: src/engine.ts
+// DESCRIPTION: Upgraded scoring engine with ALL pro indicators
+//   Multi-timeframe, order book, whale data, ADX, ATR, OBV,
+//   VWAP, Ichimoku, Fibonacci — everything feeds into score
 // ============================================================
 
 import {
-  StrategyConfig,
-  AnalysisResult,
-  IndicatorSnapshot,
-  TradeAction,
-  CoinMarketData,
-  BotPosition,
-  BotTrade,
-  BotSettings,
-  FullIndicators,
+  MarketData, AnalysisResult, StrategyConfig, BotSettings,
+  BotPosition, BotTrade, OHLCV, MultiTimeframeResult,
+  TimeframeSignal, Timeframe, WhaleData, OrderBookData,
+  IndicatorResults,
 } from './types';
-import { calculateAllIndicators } from './indicators';
+import {
+  calculateRSI, calculateMACD, calculateEMA, calculateBollingerBands,
+  calculateStochasticRSI, calculateMomentum, calculateVolumeChange,
+  calculateADX, calculateATR, calculateOBV, calculateVWAP,
+  calculateIchimoku, calculateFibonacci,
+} from './indicators';
 import { log } from './logger';
 
-const FEAR_GREED_URL = 'https://api.alternative.me/fng/?limit=1';
-
-// -- Fetch Fear & Greed Index
+// ---- Fetch Fear & Greed Index ----
 export async function fetchFearGreed(): Promise<number> {
   try {
-    const res = await fetch(FEAR_GREED_URL);
-    if (res.ok) {
-      const data = await res.json();
-      return parseInt((data as any).data?.[0]?.value || '50');
-    }
-  } catch {}
-  return 50;
+    const response = await fetch('https://api.alternative.me/fng/?limit=1', {
+      signal: AbortSignal.timeout(5000),
+    });
+    const data = await response.json();
+    return parseInt(data?.data?.[0]?.value || '50');
+  } catch {
+    return 50;
+  }
 }
 
-// -- Analyze a single coin
+// ---- Main Analysis Function ----
 export function analyzeCoin(
-  marketData: CoinMarketData,
+  marketData: MarketData,
   fearGreed: number,
-  strategy: StrategyConfig
+  strategy: StrategyConfig,
+  whaleData?: WhaleData,
+  orderBook?: OrderBookData,
+  multiTfData?: Record<Timeframe, OHLCV[]>,
 ): AnalysisResult {
-  // Extract price and volume arrays from OHLCV
-  const prices = marketData.ohlcv.map((c) => c.close);
-  const volumes = marketData.ohlcv.map((c) => c.volume);
+  const { ohlcv, pair, current_price } = marketData;
+  const closes = ohlcv.map(c => c.close);
+  const volumes = ohlcv.map(c => c.volume);
+  const weights = strategy.indicatorWeights;
+  const reasoning: string[] = [];
 
-  // Calculate all technical indicators
-  const indicators = calculateAllIndicators(prices, volumes);
+  // ============================================================
+  // CALCULATE ALL INDICATORS
+  // ============================================================
 
-  // Generate sentiment score from price action
-  const sentimentScore = Math.max(
-    -100,
-    Math.min(100, marketData.price_change_24h * 5 - 50)
-  );
+  // Original indicators
+  const rsi = calculateRSI(closes);
+  const macd = calculateMACD(closes);
+  const emaShort = calculateEMA(closes, 9);
+  const emaLong = calculateEMA(closes, 21);
+  const bb = calculateBollingerBands(closes);
+  const stochRsi = calculateStochasticRSI(closes);
+  const momentum = calculateMomentum(closes);
+  const volumeChange = calculateVolumeChange(volumes);
 
-  // Build indicator snapshot
-  const snapshot: IndicatorSnapshot = {
-    rsi: indicators.rsi,
-    macd: indicators.macd,
-    ema_short: indicators.emaShort,
-    ema_long: indicators.emaLong,
-    bollinger: indicators.bollingerBands,
-    volume_change: indicators.volumeChange,
-    momentum: indicators.momentum,
-    stochastic_rsi: indicators.stochasticRsi,
-    fear_greed: fearGreed,
-    sentiment_score: sentimentScore,
-    price_vs_ema: indicators.priceVsEma,
-    price_vs_bollinger: indicators.priceVsBollinger,
-  };
+  // NEW pro indicators
+  const adx = calculateADX(ohlcv);
+  const atr = calculateATR(ohlcv);
+  const obv = calculateOBV(ohlcv);
+  const vwap = calculateVWAP(ohlcv);
+  const ichimoku = calculateIchimoku(ohlcv);
+  const fibonacci = calculateFibonacci(ohlcv);
 
-  // Score with strategy
-  const { score, reasoning, confidence } = scoreWithStrategy(
-    indicators,
-    fearGreed,
-    sentimentScore,
-    strategy,
-    marketData
-  );
+  // ============================================================
+  // SCORE EACH INDICATOR (raw scores -100 to +100)
+  // ============================================================
+  let totalScore = 0;
+  let totalWeight = 0;
+
+  // --- RSI ---
+  let rsiScore = 0;
+  if (rsi < 25) { rsiScore = 80; reasoning.push(`RSI ${rsi.toFixed(0)} — strongly oversold`); }
+  else if (rsi < 35) { rsiScore = 50; reasoning.push(`RSI ${rsi.toFixed(0)} — oversold`); }
+  else if (rsi < 45) { rsiScore = 20; reasoning.push(`RSI ${rsi.toFixed(0)} — leaning oversold`); }
+  else if (rsi > 75) { rsiScore = -80; reasoning.push(`RSI ${rsi.toFixed(0)} — strongly overbought`); }
+  else if (rsi > 65) { rsiScore = -50; reasoning.push(`RSI ${rsi.toFixed(0)} — overbought`); }
+  else if (rsi > 55) { rsiScore = -20; reasoning.push(`RSI ${rsi.toFixed(0)} — leaning overbought`); }
+  totalScore += rsiScore * (weights.rsi / 100);
+  totalWeight += weights.rsi;
+
+  // --- MACD ---
+  let macdScore = 0;
+  if (macd.histogram > 0 && macd.macd > macd.signal) {
+    macdScore = Math.min(80, macd.histogram * 500);
+    reasoning.push('MACD bullish crossover');
+  } else if (macd.histogram < 0 && macd.macd < macd.signal) {
+    macdScore = Math.max(-80, macd.histogram * 500);
+    reasoning.push('MACD bearish');
+  }
+  totalScore += macdScore * (weights.macd / 100);
+  totalWeight += weights.macd;
+
+  // --- EMA ---
+  let emaScore = 0;
+  const emaShortVal = emaShort[emaShort.length - 1] || 0;
+  const emaLongVal = emaLong[emaLong.length - 1] || 0;
+  if (emaLongVal > 0) {
+    const emaDiff = ((emaShortVal - emaLongVal) / emaLongVal) * 100;
+    if (emaDiff > 0.5) { emaScore = Math.min(70, emaDiff * 30); reasoning.push(`EMA bullish spread ${emaDiff.toFixed(2)}%`); }
+    else if (emaDiff < -0.5) { emaScore = Math.max(-70, emaDiff * 30); reasoning.push(`EMA bearish spread ${emaDiff.toFixed(2)}%`); }
+  }
+  totalScore += emaScore * (weights.ema / 100);
+  totalWeight += weights.ema;
+
+  // --- Bollinger Bands ---
+  let bbScore = 0;
+  if (current_price < bb.lower) { bbScore = 60; reasoning.push('Price below lower Bollinger Band'); }
+  else if (current_price < bb.middle) { bbScore = 20; }
+  else if (current_price > bb.upper) { bbScore = -60; reasoning.push('Price above upper Bollinger Band'); }
+  else if (current_price > bb.middle) { bbScore = -20; }
+  totalScore += bbScore * (weights.bollingerBands / 100);
+  totalWeight += weights.bollingerBands;
+
+  // --- Volume ---
+  let volScore = 0;
+  if (volumeChange > 50) { volScore = 40; reasoning.push(`Volume surge +${volumeChange.toFixed(0)}%`); }
+  else if (volumeChange > 20) { volScore = 20; }
+  else if (volumeChange < -30) { volScore = -20; }
+  totalScore += volScore * (weights.volume / 100);
+  totalWeight += weights.volume;
+
+  // --- Stochastic RSI ---
+  let stochScore = 0;
+  if (stochRsi.k < 20 && stochRsi.d < 20) { stochScore = 60; reasoning.push('Stochastic RSI oversold'); }
+  else if (stochRsi.k < 30) { stochScore = 30; }
+  else if (stochRsi.k > 80 && stochRsi.d > 80) { stochScore = -60; }
+  else if (stochRsi.k > 70) { stochScore = -30; }
+  totalScore += stochScore * (weights.stochasticRsi / 100);
+  totalWeight += weights.stochasticRsi;
+
+  // --- Momentum ---
+  let momScore = 0;
+  if (momentum > 5) { momScore = 50; reasoning.push(`Strong upward momentum +${momentum.toFixed(1)}%`); }
+  else if (momentum > 2) { momScore = 25; }
+  else if (momentum < -5) { momScore = -50; reasoning.push(`Strong downward momentum ${momentum.toFixed(1)}%`); }
+  else if (momentum < -2) { momScore = -25; }
+  totalScore += momScore * (weights.momentum / 100);
+  totalWeight += weights.momentum;
+
+  // --- Fear & Greed ---
+  let fgScore = 0;
+  if (fearGreed < 20) { fgScore = 50; reasoning.push(`Extreme Fear (${fearGreed})`); }
+  else if (fearGreed < 35) { fgScore = 25; }
+  else if (fearGreed > 80) { fgScore = -50; reasoning.push(`Extreme Greed (${fearGreed})`); }
+  else if (fearGreed > 65) { fgScore = -25; }
+  totalScore += fgScore * (weights.fearGreed / 100);
+  totalWeight += weights.fearGreed;
+
+  // --- Sentiment (placeholder) ---
+  totalScore += 0;
+  totalWeight += weights.sentiment;
+
+  // ============================================================
+  // NEW PRO INDICATOR SCORING
+  // ============================================================
+
+  // --- ADX (Trend Strength) ---
+  const adxWeight = weights.adx || 0;
+  if (adxWeight > 0) {
+    let adxScore = 0;
+    if (adx.trending && adx.trend_direction === 'bullish') {
+      adxScore = Math.min(70, adx.adx * 1.5);
+      reasoning.push(`ADX ${adx.adx.toFixed(0)} — strong bullish trend`);
+    } else if (adx.trending && adx.trend_direction === 'bearish') {
+      adxScore = -Math.min(70, adx.adx * 1.5);
+      reasoning.push(`ADX ${adx.adx.toFixed(0)} — strong bearish trend`);
+    } else if (!adx.trending) {
+      adxScore = 0; // ranging market
+    }
+    totalScore += adxScore * (adxWeight / 100);
+    totalWeight += adxWeight;
+  }
+
+  // --- OBV (Volume Flow) ---
+  const obvWeight = weights.obv || 0;
+  if (obvWeight > 0) {
+    let obvScore = 0;
+    if (obv.divergence === 'bullish') {
+      obvScore = 60;
+      reasoning.push('OBV bullish divergence — accumulation');
+    } else if (obv.divergence === 'bearish') {
+      obvScore = -60;
+      reasoning.push('OBV bearish divergence — distribution');
+    } else if (obv.obv_trend === 'rising') {
+      obvScore = 30;
+    } else if (obv.obv_trend === 'falling') {
+      obvScore = -30;
+    }
+    totalScore += obvScore * (obvWeight / 100);
+    totalWeight += obvWeight;
+  }
+
+  // --- VWAP ---
+  const vwapWeight = weights.vwap || 0;
+  if (vwapWeight > 0) {
+    let vwapScore = 0;
+    if (vwap.position === 'below' && vwap.price_vs_vwap < -1) {
+      vwapScore = 50;
+      reasoning.push(`Price ${vwap.price_vs_vwap.toFixed(1)}% below VWAP — undervalued`);
+    } else if (vwap.position === 'below') {
+      vwapScore = 25;
+    } else if (vwap.position === 'above' && vwap.price_vs_vwap > 1) {
+      vwapScore = -50;
+      reasoning.push(`Price ${vwap.price_vs_vwap.toFixed(1)}% above VWAP — overvalued`);
+    } else if (vwap.position === 'above') {
+      vwapScore = -25;
+    }
+    totalScore += vwapScore * (vwapWeight / 100);
+    totalWeight += vwapWeight;
+  }
+
+  // --- Ichimoku Cloud ---
+  const ichimokuWeight = weights.ichimoku || 0;
+  if (ichimokuWeight > 0) {
+    let ichimokuScore = 0;
+    // Score based on signal strength (0-5)
+    if (ichimoku.signal_strength >= 4) {
+      ichimokuScore = 70;
+      reasoning.push(`Ichimoku strongly bullish (${ichimoku.signal_strength}/5)`);
+    } else if (ichimoku.signal_strength >= 3) {
+      ichimokuScore = 40;
+      reasoning.push(`Ichimoku bullish (${ichimoku.signal_strength}/5)`);
+    } else if (ichimoku.signal_strength <= 1) {
+      ichimokuScore = -60;
+      reasoning.push(`Ichimoku bearish (${ichimoku.signal_strength}/5)`);
+    } else if (ichimoku.signal_strength === 2) {
+      ichimokuScore = -20;
+    }
+    // TK cross bonus
+    if (ichimoku.tk_cross === 'bullish') { ichimokuScore += 20; reasoning.push('Ichimoku TK bullish cross'); }
+    if (ichimoku.tk_cross === 'bearish') { ichimokuScore -= 20; }
+    ichimokuScore = Math.max(-80, Math.min(80, ichimokuScore));
+    totalScore += ichimokuScore * (ichimokuWeight / 100);
+    totalWeight += ichimokuWeight;
+  }
+
+  // --- Fibonacci ---
+  const fibWeight = weights.fibonacci || 0;
+  if (fibWeight > 0) {
+    let fibScore = 0;
+    if (fibonacci.current_zone.includes('61.8%') || fibonacci.current_zone.includes('78.6%')) {
+      fibScore = 50;
+      reasoning.push(`Price at key Fibonacci support (${fibonacci.current_zone})`);
+    } else if (fibonacci.current_zone.includes('38.2%') || fibonacci.current_zone.includes('50%')) {
+      fibScore = 25;
+      reasoning.push(`Price at Fibonacci mid-zone (${fibonacci.current_zone})`);
+    } else if (fibonacci.current_zone.includes('23.6%') || fibonacci.current_zone.includes('0%')) {
+      fibScore = -30;
+    }
+    totalScore += fibScore * (fibWeight / 100);
+    totalWeight += fibWeight;
+  }
+
+  // --- Order Book Depth ---
+  const obWeight = weights.orderBook || 0;
+  if (obWeight > 0 && orderBook) {
+    let obScore = 0;
+    // imbalance > 1.3 = more bids than asks = bullish
+    if (orderBook.imbalance > 1.5) {
+      obScore = 60;
+      reasoning.push(`Order book bullish — bid/ask ratio ${orderBook.imbalance.toFixed(2)}`);
+    } else if (orderBook.imbalance > 1.2) {
+      obScore = 30;
+    } else if (orderBook.imbalance < 0.7) {
+      obScore = -60;
+      reasoning.push(`Order book bearish — bid/ask ratio ${orderBook.imbalance.toFixed(2)}`);
+    } else if (orderBook.imbalance < 0.8) {
+      obScore = -30;
+    }
+    totalScore += obScore * (obWeight / 100);
+    totalWeight += obWeight;
+  }
+
+  // --- Whale Flow ---
+  const whaleWeight = weights.whaleFlow || 0;
+  if (whaleWeight > 0 && whaleData) {
+    let whaleScore = 0;
+    if (whaleData.whale_sentiment > 30) {
+      whaleScore = 50;
+      reasoning.push(`Whale sentiment bullish (${whaleData.whale_sentiment})`);
+    } else if (whaleData.whale_sentiment > 10) {
+      whaleScore = 25;
+    } else if (whaleData.whale_sentiment < -30) {
+      whaleScore = -50;
+      reasoning.push(`Whale sentiment bearish (${whaleData.whale_sentiment})`);
+    } else if (whaleData.whale_sentiment < -10) {
+      whaleScore = -25;
+    }
+    totalScore += whaleScore * (whaleWeight / 100);
+    totalWeight += whaleWeight;
+  }
+
+  // --- Multi-Timeframe ---
+  const mtfWeight = weights.multiTimeframe || 0;
+  let multiTfResult: MultiTimeframeResult | undefined;
+  if (mtfWeight > 0 && multiTfData) {
+    multiTfResult = analyzeMultiTimeframe(multiTfData);
+    totalScore += multiTfResult.score_bonus * (mtfWeight / 100);
+    totalWeight += mtfWeight;
+    if (multiTfResult.alignment > 70) {
+      reasoning.push(`Multi-TF aligned ${multiTfResult.alignment.toFixed(0)}% — ${multiTfResult.dominant_trend}`);
+    } else if (multiTfResult.conflicting) {
+      reasoning.push('Multi-TF conflict — short vs long term disagree');
+    }
+  }
+
+  // ============================================================
+  // FINAL SCORE & CONFIDENCE
+  // ============================================================
+
+  // Normalize score — higher weight means proportionally more influence
+  const normalizedScore = totalWeight > 0
+    ? Math.round(totalScore * (100 / totalWeight) * 100) / 100
+    : 0;
+
+  // Confidence = how many indicators agree on direction
+  const indicatorScores = [rsiScore, macdScore, emaScore, bbScore, volScore, momScore, stochScore];
+  const bullish = indicatorScores.filter(s => s > 10).length;
+  const bearish = indicatorScores.filter(s => s < -10).length;
+  const total = indicatorScores.length;
+  const agreement = Math.max(bullish, bearish);
+  const confidence = Math.round((agreement / total) * 100);
 
   // Determine action
-  let action: TradeAction = 'HOLD';
-  if (
-    score >= strategy.signalThresholds.buyScore &&
-    confidence >= strategy.signalThresholds.minConfidence
-  ) {
-    action = 'BUY';
-  } else if (score <= strategy.signalThresholds.sellScore) {
+  let action: 'BUY' | 'SELL' | 'HOLD' = 'HOLD';
+  const thresholds = strategy.signalThresholds;
+
+  if (normalizedScore >= thresholds.buyScore && confidence >= thresholds.minConfidence) {
+    // Check ADX minimum if configured
+    if (thresholds.minAdx && adx.adx < thresholds.minAdx) {
+      reasoning.push(`ADX ${adx.adx.toFixed(0)} below minimum ${thresholds.minAdx} — no trend`);
+    }
+    // Check max ATR if configured
+    else if (thresholds.maxAtrPercent && atr.atr_percent > thresholds.maxAtrPercent) {
+      reasoning.push(`ATR ${atr.atr_percent.toFixed(1)}% exceeds max ${thresholds.maxAtrPercent}% — too volatile`);
+    }
+    // Check multi-timeframe alignment
+    else if (thresholds.minMultiTimeframeAlignment && multiTfResult &&
+             multiTfResult.alignment < thresholds.minMultiTimeframeAlignment) {
+      reasoning.push(`MTF alignment ${multiTfResult.alignment.toFixed(0)}% below minimum`);
+    }
+    else {
+      action = 'BUY';
+    }
+  } else if (normalizedScore <= thresholds.sellScore) {
     action = 'SELL';
   }
 
+  // Build full indicator details
+  const indicatorDetails: IndicatorResults = {
+    rsi, macd, ema_short: emaShortVal, ema_long: emaLongVal,
+    bollinger: bb, stochastic_rsi: stochRsi, volume_change: volumeChange,
+    momentum, fear_greed: fearGreed, sentiment: 0,
+    adx, atr, obv, vwap, ichimoku, fibonacci,
+  };
+
   return {
-    coin_id: marketData.symbol.toLowerCase(),
+    pair,
     symbol: marketData.symbol,
-    pair: marketData.pair,
-    current_price: marketData.current_price,
     action,
-    score,
+    score: normalizedScore,
     confidence,
+    current_price,
+    indicators: {
+      rsi, macd_histogram: macd.histogram, ema_diff: emaShortVal - emaLongVal,
+      bb_position: current_price < bb.middle ? 'below' : 'above',
+      volume_change: volumeChange, momentum, fear_greed: fearGreed,
+      stoch_rsi_k: stochRsi.k, adx: adx.adx, atr: atr.atr,
+      obv_trend: obv.obv_trend, vwap_position: vwap.position,
+      ichimoku_strength: ichimoku.signal_strength, fib_zone: fibonacci.current_zone,
+    },
     reasoning,
-    indicators: snapshot,
-    strategy: strategy.id,
-    timestamp: new Date().toISOString(),
+    multi_timeframe: multiTfResult,
+    whale_data: whaleData,
+    order_book: orderBook,
+    indicator_details: indicatorDetails,
   };
 }
 
-// -- Scoring engine (ported from original)
-function scoreWithStrategy(
-  ind: FullIndicators,
-  fearGreed: number,
-  sentiment: number,
-  strategy: StrategyConfig,
-  marketData: CoinMarketData
-): { score: number; reasoning: string[]; confidence: number } {
-  const weights = strategy.indicatorWeights;
-  const reasoning: string[] = [];
-  let totalScore = 0;
-  let bullishFactors = 0;
-  let bearishFactors = 0;
+// ---- Multi-Timeframe Analysis ----
+function analyzeMultiTimeframe(
+  tfData: Record<Timeframe, OHLCV[]>
+): MultiTimeframeResult {
+  const signals: TimeframeSignal[] = [];
 
-  // RSI Score
-  if (weights.rsi > 0) {
-    let rsiScore = 0;
-    if (ind.rsi < 30) {
-      rsiScore = 80 + (30 - ind.rsi) * 2;
-      reasoning.push(`RSI ${ind.rsi.toFixed(1)} — oversold, buy signal`);
-      bullishFactors++;
-    } else if (ind.rsi > 70) {
-      rsiScore = -(80 + (ind.rsi - 70) * 2);
-      reasoning.push(`RSI ${ind.rsi.toFixed(1)} — overbought, sell signal`);
-      bearishFactors++;
-    } else if (ind.rsi < 45) {
-      rsiScore = 30;
-      reasoning.push(`RSI ${ind.rsi.toFixed(1)} — leaning bullish`);
-      bullishFactors++;
-    } else if (ind.rsi > 55) {
-      rsiScore = -30;
-      reasoning.push(`RSI ${ind.rsi.toFixed(1)} — leaning bearish`);
-      bearishFactors++;
-    } else {
-      reasoning.push(`RSI ${ind.rsi.toFixed(1)} — neutral`);
-    }
-    totalScore += rsiScore * (weights.rsi / 100);
+  for (const [tf, candles] of Object.entries(tfData)) {
+    if (candles.length < 30) continue;
+
+    const closes = candles.map(c => c.close);
+    const rsi = calculateRSI(closes);
+    const macd = calculateMACD(closes);
+    const emaShort = calculateEMA(closes, 9);
+    const emaLong = calculateEMA(closes, 21);
+
+    const emaShortVal = emaShort[emaShort.length - 1];
+    const emaLongVal = emaLong[emaLong.length - 1];
+
+    let trend: 'bullish' | 'bearish' | 'neutral' = 'neutral';
+    let strength = 50;
+
+    // Score this timeframe
+    let tfScore = 0;
+    if (rsi < 40) tfScore += 1;
+    if (rsi > 60) tfScore -= 1;
+    if (macd.histogram > 0) tfScore += 1;
+    if (macd.histogram < 0) tfScore -= 1;
+    if (emaShortVal > emaLongVal) tfScore += 1;
+    if (emaShortVal < emaLongVal) tfScore -= 1;
+
+    if (tfScore >= 2) { trend = 'bullish'; strength = 50 + tfScore * 15; }
+    else if (tfScore <= -2) { trend = 'bearish'; strength = 50 + Math.abs(tfScore) * 15; }
+    else { strength = 50; }
+
+    signals.push({
+      timeframe: tf as Timeframe,
+      trend,
+      strength: Math.min(100, strength),
+      rsi,
+      macd_histogram: macd.histogram,
+      ema_trend: emaShortVal > emaLongVal ? 'bullish' : 'bearish',
+    });
   }
 
-  // MACD Score
-  if (weights.macd > 0) {
-    let macdScore = 0;
-    if (ind.macd.histogram > 0 && ind.macd.value > ind.macd.signal) {
-      macdScore = 60 + Math.min(40, Math.abs(ind.macd.histogram) * 1000);
-      reasoning.push('MACD bullish crossover — histogram positive');
-      bullishFactors++;
-    } else if (ind.macd.histogram < 0 && ind.macd.value < ind.macd.signal) {
-      macdScore = -(60 + Math.min(40, Math.abs(ind.macd.histogram) * 1000));
-      reasoning.push('MACD bearish crossover — histogram negative');
-      bearishFactors++;
-    } else {
-      reasoning.push('MACD neutral — no clear crossover');
-    }
-    totalScore += macdScore * (weights.macd / 100);
-  }
+  // Calculate alignment
+  const bullishCount = signals.filter(s => s.trend === 'bullish').length;
+  const bearishCount = signals.filter(s => s.trend === 'bearish').length;
+  const total = signals.length;
+  const alignment = total > 0
+    ? (Math.max(bullishCount, bearishCount) / total) * 100
+    : 0;
 
-  // EMA Score
-  if (weights.ema > 0) {
-    let emaScore = 0;
-    if (ind.emaShort > ind.emaLong) {
-      const spread = ((ind.emaShort - ind.emaLong) / ind.emaLong) * 100;
-      emaScore = 50 + Math.min(50, spread * 10);
-      reasoning.push(`EMA bullish — short above long (${spread.toFixed(2)}% spread)`);
-      bullishFactors++;
-    } else {
-      const spread = ((ind.emaLong - ind.emaShort) / ind.emaLong) * 100;
-      emaScore = -(50 + Math.min(50, spread * 10));
-      reasoning.push(`EMA bearish — short below long (${spread.toFixed(2)}% spread)`);
-      bearishFactors++;
-    }
-    totalScore += emaScore * (weights.ema / 100);
-  }
+  let dominant_trend: 'bullish' | 'bearish' | 'neutral' = 'neutral';
+  if (bullishCount > bearishCount && alignment > 50) dominant_trend = 'bullish';
+  if (bearishCount > bullishCount && alignment > 50) dominant_trend = 'bearish';
 
-  // Bollinger Bands Score
-  if (weights.bollingerBands > 0) {
-    let bbScore = 0;
-    if (ind.priceVsBollinger === 'below_lower') {
-      bbScore = 80;
-      reasoning.push('Price below lower Bollinger Band — potential bounce');
-      bullishFactors++;
-    } else if (ind.priceVsBollinger === 'above_upper') {
-      bbScore = -80;
-      reasoning.push('Price above upper Bollinger Band — potential pullback');
-      bearishFactors++;
-    } else {
-      const price = marketData.current_price;
-      const mid = ind.bollingerBands.middle;
-      if (price < mid) {
-        bbScore = 20;
-        reasoning.push('Price below BB middle — room to grow');
-      } else {
-        bbScore = -20;
-        reasoning.push('Price above BB middle — extended');
-      }
-    }
-    totalScore += bbScore * (weights.bollingerBands / 100);
-  }
+  // Score bonus — aligned timeframes boost confidence
+  let score_bonus = 0;
+  if (alignment >= 80) score_bonus = dominant_trend === 'bullish' ? 60 : -60;
+  else if (alignment >= 60) score_bonus = dominant_trend === 'bullish' ? 35 : -35;
 
-  // Volume Score
-  if (weights.volume > 0) {
-    let volScore = 0;
-    if (ind.volumeChange > 50) {
-      volScore = 60;
-      reasoning.push(`Volume surge +${ind.volumeChange.toFixed(0)}% — strong interest`);
-      bullishFactors++;
-    } else if (ind.volumeChange > 20) {
-      volScore = 30;
-      reasoning.push(`Volume rising +${ind.volumeChange.toFixed(0)}%`);
-    } else if (ind.volumeChange < -30) {
-      volScore = -40;
-      reasoning.push(`Volume declining ${ind.volumeChange.toFixed(0)}% — fading interest`);
-      bearishFactors++;
-    } else {
-      reasoning.push('Volume stable');
-    }
-    totalScore += volScore * (weights.volume / 100);
-  }
+  // Check for conflict (short bullish, long bearish or vice versa)
+  const shortTf = signals.filter(s => ['1m', '5m', '15m'].includes(s.timeframe));
+  const longTf = signals.filter(s => ['1h', '4h', '1d'].includes(s.timeframe));
+  const shortBullish = shortTf.some(s => s.trend === 'bullish');
+  const longBearish = longTf.some(s => s.trend === 'bearish');
+  const conflicting = (shortBullish && longBearish) ||
+    (shortTf.some(s => s.trend === 'bearish') && longTf.some(s => s.trend === 'bullish'));
 
-  // Sentiment Score
-  if (weights.sentiment > 0) {
-    let sentScore = 0;
-    const effectiveSentiment = strategy.id === 'contrarian' ? -sentiment : sentiment;
-    if (effectiveSentiment > 30) {
-      sentScore = 50;
-      reasoning.push(
-        strategy.id === 'contrarian'
-          ? 'Market fear detected — contrarian buy zone'
-          : 'Positive sentiment — bullish'
-      );
-      bullishFactors++;
-    } else if (effectiveSentiment < -30) {
-      sentScore = -50;
-      reasoning.push(
-        strategy.id === 'contrarian'
-          ? 'Market greed detected — contrarian sell zone'
-          : 'Negative sentiment — bearish'
-      );
-      bearishFactors++;
-    }
-    totalScore += sentScore * (weights.sentiment / 100);
-  }
-
-  // Fear & Greed Score
-  if (weights.fearGreed > 0) {
-    let fgScore = 0;
-    const isContrarian = strategy.id === 'contrarian' || strategy.id === 'dca';
-    if (fearGreed < 25) {
-      fgScore = isContrarian ? 90 : -30;
-      reasoning.push(
-        isContrarian
-          ? `Extreme Fear (${fearGreed}) — strong buy zone`
-          : `Extreme Fear (${fearGreed}) — risky market`
-      );
-      if (isContrarian) bullishFactors++;
-      else bearishFactors++;
-    } else if (fearGreed > 75) {
-      fgScore = isContrarian ? -70 : 30;
-      reasoning.push(
-        isContrarian
-          ? `Extreme Greed (${fearGreed}) — danger zone, sell`
-          : `Extreme Greed (${fearGreed}) — market euphoria`
-      );
-      if (isContrarian) bearishFactors++;
-      else bullishFactors++;
-    } else {
-      reasoning.push(`Fear & Greed neutral (${fearGreed})`);
-    }
-    totalScore += fgScore * (weights.fearGreed / 100);
-  }
-
-  // Momentum Score
-  if (weights.momentum > 0) {
-    let momScore = 0;
-    if (ind.momentum > 5) {
-      momScore = 60;
-      reasoning.push(`Strong upward momentum +${ind.momentum.toFixed(1)}%`);
-      bullishFactors++;
-    } else if (ind.momentum > 2) {
-      momScore = 30;
-      reasoning.push(`Positive momentum +${ind.momentum.toFixed(1)}%`);
-    } else if (ind.momentum < -5) {
-      momScore = -60;
-      reasoning.push(`Strong downward momentum ${ind.momentum.toFixed(1)}%`);
-      bearishFactors++;
-    } else if (ind.momentum < -2) {
-      momScore = -30;
-      reasoning.push(`Negative momentum ${ind.momentum.toFixed(1)}%`);
-    } else {
-      reasoning.push('Flat momentum');
-    }
-    totalScore += momScore * (weights.momentum / 100);
-  }
-
-  // Stochastic RSI Score
-  if (weights.stochasticRsi > 0) {
-    let stochScore = 0;
-    if (ind.stochasticRsi < 20) {
-      stochScore = 70;
-      reasoning.push(`StochRSI oversold (${ind.stochasticRsi.toFixed(0)})`);
-      bullishFactors++;
-    } else if (ind.stochasticRsi > 80) {
-      stochScore = -70;
-      reasoning.push(`StochRSI overbought (${ind.stochasticRsi.toFixed(0)})`);
-      bearishFactors++;
-    }
-    totalScore += stochScore * (weights.stochasticRsi / 100);
-  }
-
-  // DCA Special: Always buy
-  if (strategy.id === 'dca') {
-    totalScore = Math.max(totalScore, 10);
-    reasoning.push('DCA mode — scheduled buy regardless of conditions');
-    if (fearGreed < 30) {
-      reasoning.push('Smart DCA: 1.5x buy amount (market fear discount)');
-    } else if (fearGreed > 70) {
-      reasoning.push('Smart DCA: 0.5x buy amount (market overheated)');
-    }
-  }
-
-  // Calculate confidence
-  const totalFactors = bullishFactors + bearishFactors;
-  const alignment =
-    totalFactors > 0
-      ? Math.abs(bullishFactors - bearishFactors) / totalFactors
-      : 0;
-  const confidence = Math.min(
-    100,
-    Math.round(50 + alignment * 30 + Math.abs(totalScore) * 0.2)
-  );
-
-  return {
-    score: Math.round(totalScore),
-    reasoning,
-    confidence: Math.min(100, confidence),
-  };
+  return { signals, alignment, dominant_trend, score_bonus, conflicting };
 }
 
-// -- Should we execute this trade?
+// ---- Should Execute Trade (risk checks) ----
 export function shouldExecuteTrade(
   analysis: AnalysisResult,
   settings: BotSettings,
@@ -346,124 +466,95 @@ export function shouldExecuteTrade(
   recentTrades: BotTrade[],
   strategy: StrategyConfig
 ): { execute: boolean; reason: string } {
-  if (!settings.enabled) {
-    return { execute: false, reason: 'Bot is disabled' };
+  if (analysis.action === 'HOLD') {
+    return { execute: false, reason: 'HOLD signal' };
   }
 
-  // Check daily trade limit
-  const todayStart = new Date();
-  todayStart.setHours(0, 0, 0, 0);
-  const todayTrades = recentTrades.filter(
-    (t) => new Date(t.opened_at) >= todayStart
+  // Max positions
+  if (analysis.action === 'BUY' &&
+      positions.length >= strategy.riskParams.maxOpenPositions) {
+    return { execute: false, reason: `Max positions (${strategy.riskParams.maxOpenPositions}) reached` };
+  }
+
+  // Already have position in this pair
+  if (analysis.action === 'BUY' &&
+      positions.some(p => p.pair === analysis.pair)) {
+    return { execute: false, reason: 'Already holding this pair' };
+  }
+
+  // Cooldown check
+  const lastTrade = recentTrades
+    .filter(t => t.pair === analysis.pair)
+    .sort((a, b) => new Date(b.opened_at).getTime() - new Date(a.opened_at).getTime())[0];
+
+  if (lastTrade) {
+    const elapsed = Date.now() - new Date(lastTrade.opened_at).getTime();
+    if (elapsed < strategy.riskParams.cooldownMs) {
+      return { execute: false, reason: 'Cooldown period active' };
+    }
+  }
+
+  // Daily trade limit
+  const today = new Date().toISOString().split('T')[0];
+  const tradesToday = recentTrades.filter(t =>
+    t.opened_at.startsWith(today)
   ).length;
-  if (todayTrades >= settings.max_daily_trades) {
-    return { execute: false, reason: `Daily trade limit reached (${settings.max_daily_trades})` };
+  if (tradesToday >= settings.max_daily_trades) {
+    return { execute: false, reason: 'Daily trade limit reached' };
   }
 
-  // Check daily loss limit
-  const todayPnl = recentTrades
-    .filter((t) => new Date(t.opened_at) >= todayStart && t.pnl !== undefined)
-    .reduce((sum, t) => sum + (t.pnl || 0), 0);
-  const lossLimit = settings.initial_balance * (settings.daily_loss_limit_percent / 100);
-  if (todayPnl < -lossLimit) {
-    return { execute: false, reason: `Daily loss limit hit ($${lossLimit.toFixed(2)})` };
+  // Minimum balance check
+  if (analysis.action === 'BUY' && settings.current_balance < 5) {
+    return { execute: false, reason: 'Insufficient balance' };
   }
 
-  if (analysis.action === 'BUY') {
-    if (positions.length >= strategy.riskParams.maxOpenPositions) {
-      return { execute: false, reason: `Max positions (${strategy.riskParams.maxOpenPositions}) reached` };
-    }
-    if (positions.some((p) => p.pair === analysis.pair)) {
-      return { execute: false, reason: `Already holding ${analysis.symbol}` };
-    }
-    // Cooldown check
-    const lastTrade = recentTrades.find(
-      (t) => t.pair === analysis.pair && t.status === 'closed'
-    );
-    if (lastTrade && lastTrade.closed_at) {
-      const timeSince = Date.now() - new Date(lastTrade.closed_at).getTime();
-      if (timeSince < strategy.riskParams.cooldownMs) {
-        const remaining = Math.round(
-          (strategy.riskParams.cooldownMs - timeSince) / 60000
-        );
-        return { execute: false, reason: `Cooldown: ${remaining} min remaining for ${analysis.symbol}` };
-      }
-    }
-    // Check sufficient balance
-    const positionSize = settings.current_balance * (strategy.riskParams.maxPositionPercent / 100);
-    if (positionSize < 5) {
-      return { execute: false, reason: 'Insufficient balance for position' };
-    }
-    return { execute: true, reason: 'All checks passed' };
-  }
-
-  if (analysis.action === 'SELL') {
-    if (!positions.some((p) => p.pair === analysis.pair)) {
-      return { execute: false, reason: `Not holding ${analysis.symbol}` };
-    }
-    return { execute: true, reason: 'All checks passed' };
-  }
-
-  return { execute: false, reason: 'HOLD signal — no trade' };
+  return { execute: true, reason: 'All checks passed' };
 }
 
-// -- Check exit conditions (stop loss, take profit, trailing stop)
+// ---- Check Exit Conditions ----
 export function checkExitConditions(
   position: BotPosition,
   currentPrice: number,
   strategy: StrategyConfig
 ): { shouldSell: boolean; reason: string } {
-  if (
-    strategy.riskParams.stopLossPercent > 0 &&
-    currentPrice <= position.stop_loss_price
-  ) {
-    return { shouldSell: true, reason: 'Stop Loss triggered' };
+  const pnlPercent = ((currentPrice - position.entry_price) / position.entry_price) * 100;
+
+  // Stop Loss
+  if (strategy.riskParams.stopLossPercent > 0 && pnlPercent <= -strategy.riskParams.stopLossPercent) {
+    return { shouldSell: true, reason: `Stop loss hit (${pnlPercent.toFixed(2)}%)` };
   }
-  if (
-    strategy.riskParams.takeProfitPercent > 0 &&
-    position.take_profit_price > 0 &&
-    currentPrice >= position.take_profit_price
-  ) {
-    return { shouldSell: true, reason: 'Take Profit reached' };
+
+  // Take Profit
+  if (strategy.riskParams.takeProfitPercent > 0 && pnlPercent >= strategy.riskParams.takeProfitPercent) {
+    return { shouldSell: true, reason: `Take profit hit (${pnlPercent.toFixed(2)}%)` };
   }
-  if (
-    strategy.riskParams.trailingStop &&
-    position.trailing_stop_price &&
-    currentPrice <= position.trailing_stop_price
-  ) {
-    return { shouldSell: true, reason: 'Trailing Stop triggered' };
+
+  // Trailing Stop
+  if (position.trailing_stop_price && currentPrice <= position.trailing_stop_price) {
+    return { shouldSell: true, reason: `Trailing stop hit at $${position.trailing_stop_price.toFixed(2)}` };
   }
+
   return { shouldSell: false, reason: '' };
 }
 
-// -- Update trailing stop
+// ---- Update Trailing Stop ----
 export function updateTrailingStop(
   position: BotPosition,
   currentPrice: number,
   strategy: StrategyConfig
 ): BotPosition {
   if (!strategy.riskParams.trailingStop) return position;
-  if (currentPrice > position.highest_price) {
-    const newTrailingStop =
-      currentPrice * (1 - strategy.riskParams.trailingStopPercent / 100);
-    return {
-      ...position,
-      current_price: currentPrice,
-      highest_price: currentPrice,
-      trailing_stop_price: Math.max(
-        position.trailing_stop_price || 0,
-        newTrailingStop
-      ),
-      unrealized_pnl: (currentPrice - position.entry_price) * position.quantity,
-      unrealized_pnl_percent:
-        ((currentPrice - position.entry_price) / position.entry_price) * 100,
-    };
+
+  const updated = { ...position };
+
+  if (currentPrice > updated.highest_price) {
+    updated.highest_price = currentPrice;
+    const newTrailingStop = currentPrice * (1 - strategy.riskParams.trailingStopPercent / 100);
+
+    if (!updated.trailing_stop_price || newTrailingStop > updated.trailing_stop_price) {
+      updated.trailing_stop_price = newTrailingStop;
+    }
   }
-  return {
-    ...position,
-    current_price: currentPrice,
-    unrealized_pnl: (currentPrice - position.entry_price) * position.quantity,
-    unrealized_pnl_percent:
-      ((currentPrice - position.entry_price) / position.entry_price) * 100,
-  };
+
+  return updated;
 }
