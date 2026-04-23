@@ -4,6 +4,7 @@
 // DESCRIPTION: Main bot controller — PRO EDITION
 //   Circuit breakers, correlation guard, Kelly sizing,
 //   whale tracking, order book, multi-timeframe, alerts
+//   FEE-AWARE: Kraken fees deducted from P&L, min TP floor
 // ============================================================
 
 import {
@@ -30,6 +31,15 @@ const DEFAULT_PAIRS = [
   'BTC/USD', 'ETH/USD', 'SOL/USD', 'DOGE/USD', 'ADA/USD',
   'XRP/USD', 'DOT/USD', 'AVAX/USD', 'LINK/USD',
 ];
+
+// ============================================================
+// KRAKEN FEE CONFIG
+// Taker fee at $0-$10K 30-day volume tier = 0.40%
+// Round-trip (buy + sell) = 0.80%
+// Minimum TP must exceed round-trip fees to be profitable
+// ============================================================
+const KRAKEN_TAKER_FEE = 0.004;        // 0.40% per trade (taker / market order)
+const MIN_TAKE_PROFIT_PERCENT = 2.0;   // Minimum 2% TP — guarantees ~1.2% real profit after 0.80% fees
 
 export class TradingBot {
   private exchange: KrakenExchange;
@@ -103,6 +113,8 @@ export class TradingBot {
     log('info', `Whale Tracking: ${this.settings.whale_tracking_enabled ? 'ON' : 'OFF'}`);
     log('info', `Kelly Sizing: ${this.settings.kelly_sizing_enabled ? 'ON' : 'OFF'}`);
     log('info', `Correlation Guard: ${this.settings.correlation_guard_enabled ? 'ON' : 'OFF'}`);
+    log('info', `Fee-Aware Mode: ON (Kraken taker ${(KRAKEN_TAKER_FEE * 100).toFixed(2)}% per trade)`);
+    log('info', `Min Take Profit: ${MIN_TAKE_PROFIT_PERCENT}% (floor to clear fees)`);
     log('info', '========================================');
 
     const connected = await this.exchange.testConnection();
@@ -290,16 +302,22 @@ export class TradingBot {
         }
       }
 
-      // 9. Update positions
+      // 9. Update positions with FEE-ADJUSTED unrealized P&L
       for (let i = 0; i < this.positions.length; i++) {
         const md = marketDataList.find(m => m.pair === this.positions[i].pair);
         if (md) {
           this.positions[i].current_price = md.current_price;
           this.positions[i].position_value = md.current_price * this.positions[i].quantity;
-          this.positions[i].unrealized_pnl =
-            (md.current_price - this.positions[i].entry_price) * this.positions[i].quantity;
+
+          // Calculate unrealized P&L WITH estimated fees
+          const grossUnrealized = (md.current_price - this.positions[i].entry_price) * this.positions[i].quantity;
+          const buyFeeEstimate = this.positions[i].entry_price * this.positions[i].quantity * KRAKEN_TAKER_FEE;
+          const sellFeeEstimate = md.current_price * this.positions[i].quantity * KRAKEN_TAKER_FEE;
+          const estimatedFees = buyFeeEstimate + sellFeeEstimate;
+
+          this.positions[i].unrealized_pnl = grossUnrealized - estimatedFees;
           this.positions[i].unrealized_pnl_percent =
-            ((md.current_price - this.positions[i].entry_price) / this.positions[i].entry_price) * 100;
+            (this.positions[i].unrealized_pnl / (this.positions[i].entry_price * this.positions[i].quantity)) * 100;
         }
       }
 
@@ -314,7 +332,7 @@ export class TradingBot {
   }
 
   // ============================================================
-  // EXECUTE BUY — with Kelly sizing + ATR stops
+  // EXECUTE BUY — with Kelly sizing + ATR stops + MIN TP FLOOR
   // ============================================================
   private async executeBuy(
     analysis: AnalysisResult,
@@ -371,7 +389,11 @@ export class TradingBot {
 
     const price = result.price || analysis.current_price;
     const quantity = result.quantity || positionSize / price;
-    this.settings.current_balance -= positionSize;
+
+    // Deduct buy fee from balance (simulates Kraken taking the fee)
+    const buyFee = positionSize * KRAKEN_TAKER_FEE;
+    this.settings.current_balance -= (positionSize + buyFee);
+    log('info', `Buy fee: $${buyFee.toFixed(4)} (${(KRAKEN_TAKER_FEE * 100).toFixed(2)}%)`);
 
     // Calculate stops — ATR-based if enabled
     let stopLossPrice = 0;
@@ -386,6 +408,18 @@ export class TradingBot {
         ? price * (1 - strategy.riskParams.stopLossPercent / 100) : 0;
       takeProfitPrice = strategy.riskParams.takeProfitPercent > 0
         ? price * (1 + strategy.riskParams.takeProfitPercent / 100) : 0;
+    }
+
+    // ============================================================
+    // ENFORCE MINIMUM TAKE PROFIT FLOOR
+    // If ATR-based TP is too small to clear Kraken round-trip fees,
+    // raise it to the minimum so every winning trade is actually profitable
+    // ============================================================
+    const minTpPrice = price * (1 + MIN_TAKE_PROFIT_PERCENT / 100);
+    if (takeProfitPrice > 0 && takeProfitPrice < minTpPrice) {
+      const originalTpPercent = ((takeProfitPrice - price) / price * 100).toFixed(2);
+      log('info', `⚡ TP FLOOR: ATR target $${takeProfitPrice.toFixed(4)} (${originalTpPercent}%) raised to $${minTpPrice.toFixed(4)} (${MIN_TAKE_PROFIT_PERCENT}%) to clear fees`);
+      takeProfitPrice = minTpPrice;
     }
 
     const position: BotPosition = {
@@ -440,7 +474,7 @@ export class TradingBot {
     this.recentTrades.push(trade);
     await saveTrade(trade);
 
-    log('trade', `BUY ${quantity.toFixed(8)} ${analysis.symbol} @ $${price.toFixed(2)} = $${positionSize.toFixed(2)} | SL: $${stopLossPrice.toFixed(2)} | TP: $${takeProfitPrice.toFixed(2)}`);
+    log('trade', `BUY ${quantity.toFixed(8)} ${analysis.symbol} @ $${price.toFixed(2)} = $${positionSize.toFixed(2)} (fee: $${buyFee.toFixed(4)}) | SL: $${stopLossPrice.toFixed(2)} | TP: $${takeProfitPrice.toFixed(2)}`);
 
     // Send alert
     await this.alertManager.tradeOpened({
@@ -452,7 +486,7 @@ export class TradingBot {
   }
 
   // ============================================================
-  // EXECUTE SELL
+  // EXECUTE SELL — with Kraken fee deduction
   // ============================================================
   private async executeSell(
     position: BotPosition,
@@ -467,10 +501,23 @@ export class TradingBot {
     }
 
     const exitPrice = result.price || currentPrice;
-    const pnl = (exitPrice - position.entry_price) * position.quantity;
-    const pnlPercent = ((exitPrice - position.entry_price) / position.entry_price) * 100;
 
-    this.settings.current_balance += exitPrice * position.quantity;
+    // ============================================================
+    // FEE-AWARE P&L CALCULATION
+    // Deduct both buy-side and sell-side Kraken taker fees
+    // ============================================================
+    const grossPnl = (exitPrice - position.entry_price) * position.quantity;
+    const buyFee = position.entry_price * position.quantity * KRAKEN_TAKER_FEE;
+    const sellFee = exitPrice * position.quantity * KRAKEN_TAKER_FEE;
+    const totalFees = buyFee + sellFee;
+    const pnl = grossPnl - totalFees;
+    const pnlPercent = (pnl / (position.entry_price * position.quantity)) * 100;
+
+    // Credit balance: proceeds minus sell fee
+    // (buy fee was already deducted when we bought)
+    const sellProceeds = (exitPrice * position.quantity) - sellFee;
+    this.settings.current_balance += sellProceeds;
+
     this.positions = this.positions.filter(p => p.pair !== position.pair);
 
     // Update circuit breaker state
@@ -505,7 +552,7 @@ export class TradingBot {
       pnl_percent: pnlPercent,
       score: 0,
       confidence: 0,
-      reasoning: [`Exit: ${reason}`],
+      reasoning: [`Exit: ${reason}`, `Fees: $${totalFees.toFixed(4)} (buy: $${buyFee.toFixed(4)} + sell: $${sellFee.toFixed(4)})`],
       status: 'closed',
       stop_loss_price: position.stop_loss_price,
       take_profit_price: position.take_profit_price,
@@ -525,7 +572,7 @@ export class TradingBot {
 
     const sign = pnl >= 0 ? '+' : '';
     const emoji = pnl >= 0 ? '💰' : '📉';
-    log('trade', `${emoji} SELL ${position.quantity.toFixed(8)} ${position.symbol} @ $${exitPrice.toFixed(2)} | PnL: ${sign}$${pnl.toFixed(2)} (${sign}${pnlPercent.toFixed(2)}%) | ${reason} | Hold: ${holdTime}`);
+    log('trade', `${emoji} SELL ${position.quantity.toFixed(8)} ${position.symbol} @ $${exitPrice.toFixed(2)} | Gross: ${grossPnl >= 0 ? '+' : ''}$${grossPnl.toFixed(2)} | Fees: $${totalFees.toFixed(4)} | Net P&L: ${sign}$${pnl.toFixed(2)} (${sign}${pnlPercent.toFixed(2)}%) | ${reason} | Hold: ${holdTime}`);
 
     await this.alertManager.tradeClosed({
       pair: position.pair,
