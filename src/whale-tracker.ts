@@ -66,7 +66,7 @@ async function fetchBlockchairWhales(
 
     if (!response.ok) return alerts;
 
-    const data = await response.json();
+    const data: any = await response.json();
     if (!data?.data) return alerts;
 
     for (const tx of data.data) {
@@ -86,7 +86,7 @@ async function fetchBlockchairWhales(
     }
   } catch (err: any) {
     // Silently fail — whale data is supplementary
-    log('debug', `Blockchair fetch failed for ${coin}: ${err.message}`);
+    log('warn', `Blockchair fetch failed for ${coin}: ${err.message}`);
   }
 
   return alerts;
@@ -105,7 +105,7 @@ async function fetchExchangeNetflow(coinId: string): Promise<number> {
 
     if (!response.ok) return 0;
 
-    const data = await response.json();
+    const data: any = await response.json();
     if (!data?.tickers) return 0;
 
     // Analyze bid/ask volume ratio across exchanges as flow proxy
@@ -194,7 +194,7 @@ export class WhaleTracker {
 
       return whaleData;
     } catch (err: any) {
-      log('debug', `Whale tracking failed for ${pair}: ${err.message}`);
+      log('warn', `Whale tracking failed for ${pair}: ${err.message}`);
       return this.emptyWhaleData(pair);
     }
   }
