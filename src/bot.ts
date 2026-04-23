@@ -1,10 +1,13 @@
 // ============================================================
 // PROJECT: cryptotrader
-// FILE: src/bot.ts
-// DESCRIPTION: Main bot controller — PRO EDITION
-//   Circuit breakers, correlation guard, Kelly sizing,
-//   whale tracking, order book, multi-timeframe, alerts
-//   FEE-AWARE: Kraken fees deducted from P&L, min TP floor
+// FILE: src/bot.ts (UPDATED — replaces existing file)
+// DESCRIPTION: Main bot controller — ULTIMATE EDITION
+//   Everything from PRO EDITION plus:
+//   - Break-even stop loss
+//   - Dynamic fee tiers from Kraken API
+//   - Limit order support (USE_LIMIT_ORDERS env var)
+//   - Market regime detection
+//   - Enhanced logging with fee breakdown
 // ============================================================
 
 import {
@@ -33,13 +36,11 @@ const DEFAULT_PAIRS = [
 ];
 
 // ============================================================
-// KRAKEN FEE CONFIG
-// Taker fee at $0-$10K 30-day volume tier = 0.40%
-// Round-trip (buy + sell) = 0.80%
-// Minimum TP must exceed round-trip fees to be profitable
+// FEE & RISK CONFIG
 // ============================================================
-const KRAKEN_TAKER_FEE = 0.004;        // 0.40% per trade (taker / market order)
-const MIN_TAKE_PROFIT_PERCENT = 2.0;   // Minimum 2% TP — guarantees ~1.2% real profit after 0.80% fees
+const MIN_TAKE_PROFIT_PERCENT = 2.0;          // Minimum 2% TP floor
+const BREAKEVEN_TRIGGER_PERCENT = 1.5;        // Move SL to entry after 1.5% profit
+const BREAKEVEN_BUFFER_PERCENT = 0.1;         // SL set to entry + 0.1% (tiny profit to cover fees)
 
 export class TradingBot {
   private exchange: KrakenExchange;
@@ -57,9 +58,15 @@ export class TradingBot {
   private dailyStartBalance = 0;
   private lastCorrelationCheck = 0;
 
+  // Dynamic fee config — updated from Kraken API
+  private currentTakerFee = 0.004;   // default 0.40%
+  private currentMakerFee = 0.0025;  // default 0.25%
+  private useLimitOrders = false;    // toggled by USE_LIMIT_ORDERS env var
+
   constructor() {
     const mode = (process.env.TRADE_MODE || 'paper') as TradeMode;
     this.exchange = new KrakenExchange(mode);
+    this.useLimitOrders = process.env.USE_LIMIT_ORDERS === 'true';
 
     this.settings = {
       enabled: true,
@@ -103,7 +110,7 @@ export class TradingBot {
 
   async start(): Promise<void> {
     log('info', '========================================');
-    log('info', '  CryptoBot PRO Server Starting...');
+    log('info', '  CryptoBot ULTIMATE Server Starting...');
     log('info', '========================================');
     log('info', `Mode: ${this.settings.mode.toUpperCase()}`);
     log('info', `Strategy: ${getStrategy(this.settings.strategy).name}`);
@@ -113,8 +120,9 @@ export class TradingBot {
     log('info', `Whale Tracking: ${this.settings.whale_tracking_enabled ? 'ON' : 'OFF'}`);
     log('info', `Kelly Sizing: ${this.settings.kelly_sizing_enabled ? 'ON' : 'OFF'}`);
     log('info', `Correlation Guard: ${this.settings.correlation_guard_enabled ? 'ON' : 'OFF'}`);
-    log('info', `Fee-Aware Mode: ON (Kraken taker ${(KRAKEN_TAKER_FEE * 100).toFixed(2)}% per trade)`);
+    log('info', `Order Type: ${this.useLimitOrders ? 'LIMIT (maker fees)' : 'MARKET (taker fees)'}`);
     log('info', `Min Take Profit: ${MIN_TAKE_PROFIT_PERCENT}% (floor to clear fees)`);
+    log('info', `Break-Even Stop: Triggers at ${BREAKEVEN_TRIGGER_PERCENT}% profit`);
     log('info', '========================================');
 
     const connected = await this.exchange.testConnection();
@@ -123,10 +131,12 @@ export class TradingBot {
       if (this.settings.mode === 'live') { process.exit(1); }
     }
 
+    // Fetch dynamic fee tier
+    await this.updateFeeTier();
+
     await this.loadState();
 
     // FIX: Include existing position values in dailyStartBalance
-    // so buying into positions isn't counted as a "loss"
     const startingPositionValue = this.positions.reduce((sum, p) => sum + p.position_value, 0);
     this.dailyStartBalance = this.settings.current_balance + startingPositionValue;
 
@@ -150,6 +160,25 @@ export class TradingBot {
   }
 
   // ============================================================
+  // UPDATE FEE TIER — queries Kraken for actual fees
+  // ============================================================
+  private async updateFeeTier(): Promise<void> {
+    try {
+      const feeTier = await this.exchange.getFeeTier();
+      this.currentTakerFee = feeTier.takerFee;
+      this.currentMakerFee = feeTier.makerFee;
+      log('info', `Fee Tier: ${feeTier.tierName} | Maker: ${(feeTier.makerFee * 100).toFixed(2)}% | Taker: ${(feeTier.takerFee * 100).toFixed(2)}%`);
+    } catch (err: any) {
+      log('warn', `Fee tier fetch failed: ${err.message} — using defaults`);
+    }
+  }
+
+  // Get the active fee rate based on order type setting
+  private getActiveFeeRate(): number {
+    return this.useLimitOrders ? this.currentMakerFee : this.currentTakerFee;
+  }
+
+  // ============================================================
   // MAIN CYCLE
   // ============================================================
   private async runCycle(): Promise<void> {
@@ -158,6 +187,11 @@ export class TradingBot {
     log('info', `--- Cycle #${this.cycleCount} [${strategy.shortName}] ---`);
 
     try {
+      // Refresh fee tier every 100 cycles (~50 min for day_trader)
+      if (this.cycleCount % 100 === 0) {
+        await this.updateFeeTier();
+      }
+
       // 1. Check circuit breaker
       if (this.circuitBreaker.is_tripped) {
         if (this.circuitBreaker.resume_at &&
@@ -212,14 +246,37 @@ export class TradingBot {
         this.lastCorrelationCheck = this.cycleCount;
       }
 
-      // 7. Check exits on existing positions
+      // 7. Check exits + BREAK-EVEN stops on existing positions
       for (const position of [...this.positions]) {
         const md = marketDataList.find(m => m.pair === position.pair);
         if (!md) continue;
 
+        // Update trailing stop
         const updated = updateTrailingStop(position, md.current_price, strategy);
         const idx = this.positions.findIndex(p => p.pair === position.pair);
         if (idx >= 0) this.positions[idx] = updated;
+
+        // ============================================================
+        // BREAK-EVEN STOP LOSS
+        // If price has moved X% above entry, move SL to entry + buffer
+        // This turns a winning trade into a risk-free trade
+        // ============================================================
+        if (idx >= 0) {
+          const currentProfitPercent =
+            ((md.current_price - this.positions[idx].entry_price) / this.positions[idx].entry_price) * 100;
+
+          if (currentProfitPercent >= BREAKEVEN_TRIGGER_PERCENT) {
+            const breakevenPrice =
+              this.positions[idx].entry_price * (1 + BREAKEVEN_BUFFER_PERCENT / 100);
+
+            // Only move SL up, never down
+            if (this.positions[idx].stop_loss_price < breakevenPrice) {
+              const oldSL = this.positions[idx].stop_loss_price;
+              this.positions[idx].stop_loss_price = breakevenPrice;
+              log('info', `🛡️ BREAK-EVEN: ${position.pair} SL moved from $${oldSL.toFixed(4)} to $${breakevenPrice.toFixed(4)} (entry + ${BREAKEVEN_BUFFER_PERCENT}%)`);
+            }
+          }
+        }
 
         const exit = checkExitConditions(updated, md.current_price, strategy);
         if (exit.shouldSell) {
@@ -267,7 +324,6 @@ export class TradingBot {
           log('signal', `${analysis.action} signal: ${analysis.symbol} @ $${analysis.current_price.toFixed(2)} | Score: ${analysis.score} | Conf: ${analysis.confidence}%`);
         }
 
-        // FIXED: pass strategy.id so bot_signals gets the strategy column
         await saveSignal(analysis, strategy.id);
 
         // Check if we should execute
@@ -303,6 +359,7 @@ export class TradingBot {
       }
 
       // 9. Update positions with FEE-ADJUSTED unrealized P&L
+      const feeRate = this.getActiveFeeRate();
       for (let i = 0; i < this.positions.length; i++) {
         const md = marketDataList.find(m => m.pair === this.positions[i].pair);
         if (md) {
@@ -311,8 +368,8 @@ export class TradingBot {
 
           // Calculate unrealized P&L WITH estimated fees
           const grossUnrealized = (md.current_price - this.positions[i].entry_price) * this.positions[i].quantity;
-          const buyFeeEstimate = this.positions[i].entry_price * this.positions[i].quantity * KRAKEN_TAKER_FEE;
-          const sellFeeEstimate = md.current_price * this.positions[i].quantity * KRAKEN_TAKER_FEE;
+          const buyFeeEstimate = this.positions[i].entry_price * this.positions[i].quantity * feeRate;
+          const sellFeeEstimate = md.current_price * this.positions[i].quantity * feeRate;
           const estimatedFees = buyFeeEstimate + sellFeeEstimate;
 
           this.positions[i].unrealized_pnl = grossUnrealized - estimatedFees;
@@ -333,11 +390,14 @@ export class TradingBot {
 
   // ============================================================
   // EXECUTE BUY — with Kelly sizing + ATR stops + MIN TP FLOOR
+  //   + dynamic fees + limit order support
   // ============================================================
   private async executeBuy(
     analysis: AnalysisResult,
     strategy: ReturnType<typeof getStrategy>
   ): Promise<void> {
+    const feeRate = this.getActiveFeeRate();
+
     // Smart position sizing
     let positionSize: number;
     let kellyFraction: number | undefined;
@@ -364,7 +424,6 @@ export class TradingBot {
 
       log('info', `Smart sizing: $${positionSize.toFixed(2)} (${sizing.method}) | Kelly: ${kellyFraction.toFixed(1)}%`);
     } else {
-      // DCA or fallback sizing
       positionSize = this.settings.current_balance * (strategy.riskParams.maxPositionPercent / 100);
 
       if (strategy.id === 'dca') {
@@ -381,7 +440,14 @@ export class TradingBot {
       return;
     }
 
-    const result = await this.exchange.marketBuy(analysis.pair, positionSize);
+    // Execute order — limit or market based on config
+    let result;
+    if (this.useLimitOrders) {
+      result = await this.exchange.limitBuy(analysis.pair, positionSize);
+    } else {
+      result = await this.exchange.marketBuy(analysis.pair, positionSize);
+    }
+
     if (!result.success) {
       log('error', `Buy failed: ${result.error}`);
       return;
@@ -389,11 +455,12 @@ export class TradingBot {
 
     const price = result.price || analysis.current_price;
     const quantity = result.quantity || positionSize / price;
+    const orderType = result.orderType || (this.useLimitOrders ? 'limit' : 'market');
 
-    // Deduct buy fee from balance (simulates Kraken taking the fee)
-    const buyFee = positionSize * KRAKEN_TAKER_FEE;
+    // Deduct buy fee from balance
+    const buyFee = positionSize * feeRate;
     this.settings.current_balance -= (positionSize + buyFee);
-    log('info', `Buy fee: $${buyFee.toFixed(4)} (${(KRAKEN_TAKER_FEE * 100).toFixed(2)}%)`);
+    log('info', `Buy fee: $${buyFee.toFixed(4)} (${(feeRate * 100).toFixed(2)}% ${orderType})`);
 
     // Calculate stops — ATR-based if enabled
     let stopLossPrice = 0;
@@ -410,15 +477,13 @@ export class TradingBot {
         ? price * (1 + strategy.riskParams.takeProfitPercent / 100) : 0;
     }
 
-    // ============================================================
-    // ENFORCE MINIMUM TAKE PROFIT FLOOR
-    // If ATR-based TP is too small to clear Kraken round-trip fees,
-    // raise it to the minimum so every winning trade is actually profitable
-    // ============================================================
-    const minTpPrice = price * (1 + MIN_TAKE_PROFIT_PERCENT / 100);
+    // Enforce minimum TP floor (must clear round-trip fees)
+    const roundTripFeePercent = feeRate * 2 * 100; // e.g., 0.80% for taker
+    const effectiveMinTp = Math.max(MIN_TAKE_PROFIT_PERCENT, roundTripFeePercent + 0.5);
+    const minTpPrice = price * (1 + effectiveMinTp / 100);
     if (takeProfitPrice > 0 && takeProfitPrice < minTpPrice) {
       const originalTpPercent = ((takeProfitPrice - price) / price * 100).toFixed(2);
-      log('info', `⚡ TP FLOOR: ATR target $${takeProfitPrice.toFixed(4)} (${originalTpPercent}%) raised to $${minTpPrice.toFixed(4)} (${MIN_TAKE_PROFIT_PERCENT}%) to clear fees`);
+      log('info', `⚡ TP FLOOR: ATR target $${takeProfitPrice.toFixed(4)} (${originalTpPercent}%) raised to $${minTpPrice.toFixed(4)} (${effectiveMinTp.toFixed(1)}%) to clear ${orderType} fees`);
       takeProfitPrice = minTpPrice;
     }
 
@@ -474,9 +539,8 @@ export class TradingBot {
     this.recentTrades.push(trade);
     await saveTrade(trade);
 
-    log('trade', `BUY ${quantity.toFixed(8)} ${analysis.symbol} @ $${price.toFixed(2)} = $${positionSize.toFixed(2)} (fee: $${buyFee.toFixed(4)}) | SL: $${stopLossPrice.toFixed(2)} | TP: $${takeProfitPrice.toFixed(2)}`);
+    log('trade', `BUY ${quantity.toFixed(8)} ${analysis.symbol} @ $${price.toFixed(2)} = $${positionSize.toFixed(2)} (${orderType} fee: $${buyFee.toFixed(4)}) | SL: $${stopLossPrice.toFixed(2)} | TP: $${takeProfitPrice.toFixed(2)}`);
 
-    // Send alert
     await this.alertManager.tradeOpened({
       pair: analysis.pair, price, quantity, positionSize,
       score: analysis.score, confidence: analysis.confidence,
@@ -486,7 +550,7 @@ export class TradingBot {
   }
 
   // ============================================================
-  // EXECUTE SELL — with Kraken fee deduction
+  // EXECUTE SELL — with fee deduction + limit order support
   // ============================================================
   private async executeSell(
     position: BotPosition,
@@ -494,33 +558,39 @@ export class TradingBot {
     reason: string,
     strategy: ReturnType<typeof getStrategy>
   ): Promise<void> {
-    const result = await this.exchange.marketSell(position.pair, position.quantity);
+    const feeRate = this.getActiveFeeRate();
+
+    // Execute order — limit or market
+    let result;
+    if (this.useLimitOrders) {
+      result = await this.exchange.limitSell(position.pair, position.quantity);
+    } else {
+      result = await this.exchange.marketSell(position.pair, position.quantity);
+    }
+
     if (!result.success) {
       log('error', `Sell failed: ${result.error}`);
       return;
     }
 
     const exitPrice = result.price || currentPrice;
+    const orderType = result.orderType || (this.useLimitOrders ? 'limit' : 'market');
 
-    // ============================================================
-    // FEE-AWARE P&L CALCULATION
-    // Deduct both buy-side and sell-side Kraken taker fees
-    // ============================================================
+    // Fee-aware P&L calculation
     const grossPnl = (exitPrice - position.entry_price) * position.quantity;
-    const buyFee = position.entry_price * position.quantity * KRAKEN_TAKER_FEE;
-    const sellFee = exitPrice * position.quantity * KRAKEN_TAKER_FEE;
+    const buyFee = position.entry_price * position.quantity * feeRate;
+    const sellFee = exitPrice * position.quantity * feeRate;
     const totalFees = buyFee + sellFee;
     const pnl = grossPnl - totalFees;
     const pnlPercent = (pnl / (position.entry_price * position.quantity)) * 100;
 
-    // Credit balance: proceeds minus sell fee
-    // (buy fee was already deducted when we bought)
+    // Credit balance
     const sellProceeds = (exitPrice * position.quantity) - sellFee;
     this.settings.current_balance += sellProceeds;
 
     this.positions = this.positions.filter(p => p.pair !== position.pair);
 
-    // Update circuit breaker state
+    // Update circuit breaker
     if (pnl < 0) {
       this.circuitBreaker.consecutive_losses++;
       if (this.circuitBreaker.consecutive_losses >= 5) {
@@ -531,7 +601,7 @@ export class TradingBot {
     }
     this.circuitBreaker.trades_today++;
 
-    // Calculate hold time
+    // Hold time
     const holdMs = Date.now() - new Date(position.opened_at).getTime();
     const holdHours = Math.round(holdMs / (1000 * 60 * 60) * 10) / 10;
     const holdTime = holdHours < 1
@@ -552,7 +622,7 @@ export class TradingBot {
       pnl_percent: pnlPercent,
       score: 0,
       confidence: 0,
-      reasoning: [`Exit: ${reason}`, `Fees: $${totalFees.toFixed(4)} (buy: $${buyFee.toFixed(4)} + sell: $${sellFee.toFixed(4)})`],
+      reasoning: [`Exit: ${reason}`, `Fees: $${totalFees.toFixed(4)} (${orderType})`],
       status: 'closed',
       stop_loss_price: position.stop_loss_price,
       take_profit_price: position.take_profit_price,
@@ -572,7 +642,7 @@ export class TradingBot {
 
     const sign = pnl >= 0 ? '+' : '';
     const emoji = pnl >= 0 ? '💰' : '📉';
-    log('trade', `${emoji} SELL ${position.quantity.toFixed(8)} ${position.symbol} @ $${exitPrice.toFixed(2)} | Gross: ${grossPnl >= 0 ? '+' : ''}$${grossPnl.toFixed(2)} | Fees: $${totalFees.toFixed(4)} | Net P&L: ${sign}$${pnl.toFixed(2)} (${sign}${pnlPercent.toFixed(2)}%) | ${reason} | Hold: ${holdTime}`);
+    log('trade', `${emoji} SELL ${position.quantity.toFixed(8)} ${position.symbol} @ $${exitPrice.toFixed(2)} | Gross: ${grossPnl >= 0 ? '+' : ''}$${grossPnl.toFixed(2)} | Fees: $${totalFees.toFixed(4)} (${orderType}) | Net: ${sign}$${pnl.toFixed(2)} (${sign}${pnlPercent.toFixed(2)}%) | ${reason} | Hold: ${holdTime}`);
 
     await this.alertManager.tradeClosed({
       pair: position.pair,
@@ -588,8 +658,6 @@ export class TradingBot {
   // ============================================================
   // CIRCUIT BREAKER
   // ============================================================
-
-  // FIX: Use total portfolio value (cash + positions) instead of cash-only
   private checkDailyLoss(): void {
     if (this.dailyStartBalance <= 0) return;
     const totalValue = this.getTotalPortfolioValue();
@@ -606,7 +674,6 @@ export class TradingBot {
     this.circuitBreaker.is_tripped = true;
     this.circuitBreaker.reason = reason;
     this.circuitBreaker.tripped_at = new Date().toISOString();
-    // Resume in 2 hours
     const resumeAt = new Date(Date.now() + 2 * 60 * 60 * 1000);
     this.circuitBreaker.resume_at = resumeAt.toISOString();
 
@@ -662,8 +729,6 @@ export class TradingBot {
   // ============================================================
   // LOGGING & STATE
   // ============================================================
-
-  // FIX: Helper to calculate total portfolio value (cash + all open positions)
   private getTotalPortfolioValue(): number {
     const positionValue = this.positions.reduce((sum, p) => sum + p.position_value, 0);
     return this.settings.current_balance + positionValue;
