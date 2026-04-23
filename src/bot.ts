@@ -825,7 +825,7 @@ export class TradingBot {
       price: fillPrice,
       score: 0,
       confidence: 0,
-      size: dcaBudget,
+      positionSize: dcaBudget,
       reason: `DCA Safety Order #${dcaOrderNumber} — averaged down from $${position.entry_price.toFixed(2)} to $${newAvg.toFixed(2)}`,
     });
   }
