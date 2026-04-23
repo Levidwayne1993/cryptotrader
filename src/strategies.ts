@@ -20,7 +20,7 @@ export const STRATEGIES: Record<StrategyType, StrategyConfig> = {
       trailingStopPercent: 2,
       cooldownMs: 5 * 60 * 1000,
     },
-    signalThresholds: { buyScore: 20, sellScore: -15, minConfidence: 45 },
+    signalThresholds: { buyScore: 8, sellScore: -8, minConfidence: 35 },
     indicatorWeights: {
       rsi: 20, macd: 20, ema: 15, bollingerBands: 10,
       volume: 15, sentiment: 5, fearGreed: 3, momentum: 10, stochasticRsi: 2,
