@@ -8,6 +8,7 @@
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import { BotTrade, BotPosition, BotSettings, AnalysisResult } from './types';
 import { log } from './logger';
+import { getCoinIdFromPair } from './exchange';
 
 let supabase: SupabaseClient | null = null;
 
@@ -109,6 +110,7 @@ export async function saveSignal(analysis: AnalysisResult): Promise<void> {
     }
 
     const { error } = await db.from('bot_signals').insert({
+      coin_id: getCoinIdFromPair(analysis.pair),
       pair: analysis.pair,
       symbol: analysis.symbol,
       action: analysis.action,
