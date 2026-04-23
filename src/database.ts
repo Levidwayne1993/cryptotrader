@@ -121,7 +121,7 @@ export async function saveSignal(analysis: AnalysisResult, strategy: string): Pr
       reasoning: analysis.reasoning,
       current_price: analysis.current_price,
       indicators: analysis.indicators,
-      created_at: new Date().toISOString(),
+      timestamp: new Date().toISOString(),
       // PRO FIELDS
       adx: adx,
       atr_percent: atrPercent,
