@@ -26,7 +26,7 @@ export async function fetchFearGreed(): Promise<number> {
     const response = await fetch('https://api.alternative.me/fng/?limit=1', {
       signal: AbortSignal.timeout(5000),
     });
-    const data = await response.json();
+    const data = await response.json() as any;
     return parseInt(data?.data?.[0]?.value || '50');
   } catch {
     return 50;

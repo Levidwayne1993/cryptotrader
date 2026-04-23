@@ -185,7 +185,7 @@ export class TradingBot {
             this.settings.selected_pairs
           );
         } catch (err: any) {
-          log('debug', `Whale data fetch failed: ${err.message}`);
+          log('warn', `Whale data fetch failed: ${err.message}`);
         }
       }
 
@@ -568,7 +568,7 @@ export class TradingBot {
   // ============================================================
   // CORRELATION GUARD
   // ============================================================
-  private async updateCorrelations(): Promise<void> {
+    private async updateCorrelations(): Promise<void> {
     try {
       const result = await this.exchange.calculateCorrelation(
         this.settings.selected_pairs, '1h', 50
@@ -582,9 +582,10 @@ export class TradingBot {
         log('info', `Correlation: ${result.highly_correlated.length} highly correlated pairs found`);
       }
     } catch (err: any) {
-      log('debug', `Correlation update failed: ${err.message}`);
+      log('warn', `Correlation update failed: ${err.message}`);
     }
   }
+
 
   private checkCorrelationGuard(newPair: string): boolean {
     const maxCorrelated = this.settings.max_correlated_positions || 3;
@@ -597,7 +598,7 @@ export class TradingBot {
 
       if (corr && Math.abs(corr) > 0.7) {
         correlatedCount++;
-        log('debug', `${newPair} correlated with ${pos.pair}: ${corr}`);
+        log('info', `${newPair} correlated with ${pos.pair}: ${corr}`);
       }
     }
 

@@ -74,13 +74,13 @@ export class KrakenExchange {
       const response = await fetch(`${this.baseUrl}/0/public/SystemStatus`, {
         signal: AbortSignal.timeout(10000),
       });
-      const data = await response.json();
+      const data = await response.json() as any;
       if (data?.result?.status === 'online') {
         // Get market count
         const assetPairs = await fetch(`${this.baseUrl}/0/public/AssetPairs`, {
           signal: AbortSignal.timeout(10000),
         });
-        const pairs = await assetPairs.json();
+        const pairs = await assetPairs.json() as any;
         const count = Object.keys(pairs?.result || {}).length;
         log('info', `Connected to Kraken — ${count} markets available`);
         return true;
@@ -116,7 +116,7 @@ export class KrakenExchange {
       const response = await fetch(url, {
         signal: AbortSignal.timeout(15000),
       });
-      const data = await response.json();
+      const data = await response.json() as any;
 
       if (data.error && data.error.length > 0) {
         log('warn', `Kraken OHLC error for ${pair}: ${data.error.join(', ')}`);
@@ -199,7 +199,7 @@ export class KrakenExchange {
       const tickerRes = await fetch(`${this.baseUrl}/0/public/Ticker?pair=${krakenPair}`, {
         signal: AbortSignal.timeout(10000),
       });
-      const tickerData = await tickerRes.json();
+      const tickerData = await tickerRes.json() as any;
       const key = Object.keys(tickerData.result || {})[0];
       if (key && tickerData.result[key]) {
         bid = parseFloat(tickerData.result[key].b[0]);
@@ -243,7 +243,7 @@ export class KrakenExchange {
       const krakenPair = getPair(pair);
       const url = `${this.baseUrl}/0/public/Depth?pair=${krakenPair}&count=${depth}`;
       const response = await fetch(url, { signal: AbortSignal.timeout(10000) });
-      const data = await response.json();
+      const data = await response.json() as any;
 
       if (data.error?.length > 0) return null;
 
