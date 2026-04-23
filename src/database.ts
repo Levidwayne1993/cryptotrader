@@ -90,7 +90,8 @@ export async function updateTrade(
 }
 
 // -- Save a signal/analysis result (with PRO fields)
-export async function saveSignal(analysis: AnalysisResult): Promise<void> {
+// FIXED: Added strategy parameter to include in bot_signals insert
+export async function saveSignal(analysis: AnalysisResult, strategy: string): Promise<void> {
   try {
     const db = getSupabase();
 
@@ -114,6 +115,7 @@ export async function saveSignal(analysis: AnalysisResult): Promise<void> {
       pair: analysis.pair,
       symbol: analysis.symbol,
       action: analysis.action,
+      strategy: strategy,
       score: analysis.score,
       confidence: analysis.confidence,
       reasoning: analysis.reasoning,

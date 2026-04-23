@@ -251,7 +251,8 @@ export class TradingBot {
           log('signal', `${analysis.action} signal: ${analysis.symbol} @ $${analysis.current_price.toFixed(2)} | Score: ${analysis.score} | Conf: ${analysis.confidence}%`);
         }
 
-        await saveSignal(analysis);
+        // FIXED: pass strategy.id so bot_signals gets the strategy column
+        await saveSignal(analysis, strategy.id);
 
         // Check if we should execute
         const { execute, reason } = shouldExecuteTrade(
@@ -568,7 +569,7 @@ export class TradingBot {
   // ============================================================
   // CORRELATION GUARD
   // ============================================================
-    private async updateCorrelations(): Promise<void> {
+  private async updateCorrelations(): Promise<void> {
     try {
       const result = await this.exchange.calculateCorrelation(
         this.settings.selected_pairs, '1h', 50
@@ -585,7 +586,6 @@ export class TradingBot {
       log('warn', `Correlation update failed: ${err.message}`);
     }
   }
-
 
   private checkCorrelationGuard(newPair: string): boolean {
     const maxCorrelated = this.settings.max_correlated_positions || 3;
