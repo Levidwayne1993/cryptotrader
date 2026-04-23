@@ -314,7 +314,7 @@ export class TradingBot {
         // Run analysis with ALL pro data
         const analysis = analyzeCoin(
           md, fearGreed, strategy,
-          whaleData, orderBook, multiTfData
+          whaleData, orderBook as any, multiTfData
         );
 
         // Log every score

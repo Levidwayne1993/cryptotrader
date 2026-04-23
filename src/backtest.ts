@@ -352,7 +352,7 @@ export class BacktestEngine {
         while (fetchSince < endTimestamp) {
           const url = `https://api.kraken.com/0/public/OHLC?pair=${krakenPair}&interval=${interval}&since=${fetchSince}`;
           const response = await fetch(url);
-          const json = await response.json();
+          const json: any = await response.json();
 
           if (json.error && json.error.length > 0) {
             log('warn', `Kraken API error for ${pair}: ${json.error.join(', ')}`);
